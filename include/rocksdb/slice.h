@@ -213,6 +213,13 @@ inline bool operator!=(const Slice& x, const Slice& y) {
   return !(x == y);
 }
 
+
+inline bool operator<(const Slice& x, const Slice& y) {
+  return x.compare(y) < 0;
+}
+
+
+
 // UBSAN complain that we pass nullptr to memcmp that's fine since
 // we always do that for a string of len = 0
 #ifdef ROCKSDB_UBSAN_RUN

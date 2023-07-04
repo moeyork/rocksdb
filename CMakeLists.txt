@@ -473,6 +473,8 @@ set(SOURCES
         util/threadpool_imp.cc
         util/transaction_test_util.cc
         util/xxhash.cc
+        util/zipf.cc
+        util/latest-generator.cc
         utilities/backupable/backupable_db.cc
         utilities/blob_db/blob_db.cc
         utilities/blob_db/blob_db_impl.cc

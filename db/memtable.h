@@ -15,6 +15,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <utility>
+#include <mutex>
+#include <map>
+
 #include "db/dbformat.h"
 #include "db/range_del_aggregator.h"
 #include "db/version_edit.h"
@@ -161,6 +165,14 @@ class MemTable {
   InternalIterator* NewIterator(const ReadOptions& read_options, Arena* arena);
 
   InternalIterator* NewRangeTombstoneIterator(const ReadOptions& read_options);
+
+  void PrintFrequencies();
+  std::map<std::string, uint32_t> SelectHotKeysWithError(std::map<std::string, uint32_t> frequenciesMap, int errorRate);
+
+  std::map<std::string, uint32_t> SelectHotKeysWithMean(std::map<std::string, uint32_t> frequenciesMap);
+
+  bool GetHotColdKeys(MemTable* hot_key_mem, MemTable* cold_key_mem, 
+                      ReadOptions read_options);
 
   // Add an entry into memtable that maps key to value at the
   // specified sequence number and with the specified type.
@@ -354,6 +366,9 @@ class MemTable {
   friend class MemTableIterator;
   friend class MemTableBackwardIterator;
   friend class MemTableList;
+
+  std::map<std::string, uint32_t> KeyFrequencies;
+  std::mutex m;
 
   KeyComparator comparator_;
   const MemTableOptions moptions_;

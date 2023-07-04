@@ -546,7 +546,13 @@ class Repairer {
         edit.AddFile(0, table->meta.fd.GetNumber(), table->meta.fd.GetPathId(),
                      table->meta.fd.GetFileSize(), table->meta.smallest,
                      table->meta.largest, table->min_sequence,
-                     table->max_sequence, table->meta.marked_for_compaction);
+                     table->max_sequence, table->meta.marked_for_compaction,
+                     std::make_shared<HyperLogLog>(12),
+                     0 /*reclaim_ratio*/,
+                     100000000/*file_num_low*/,
+                     0/*file_num_high*/,
+                     0/*num_sst_next_level_overlap*/,
+                     0/*hll_add_count*/);
       }
       mutex_.Lock();
       Status status = vset_.LogAndApply(

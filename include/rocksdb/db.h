@@ -799,6 +799,10 @@ class DB {
   virtual Status PauseBackgroundWork() = 0;
   virtual Status ContinueBackgroundWork() = 0;
 
+  virtual Status PauseCompactionWork() = 0;
+  virtual Status ContinueCompactionWork() = 0;
+
+
   // This function will enable automatic compactions for the given column
   // families if they were previously disabled. The function will first set the
   // disable_auto_compactions option for each column family to 'false', after

@@ -970,6 +970,8 @@ Status ParseDBOption(const std::string& name,
       input_strings_escaped ? UnescapeOptionString(org_value) : org_value;
   try {
     if (name == "rate_limiter_bytes_per_sec") {
+
+      printf(">>>> ParseDBOption rate limiter rate_limiter_bytes_per_sec \n");
       new_options->rate_limiter.reset(
           NewGenericRateLimiter(static_cast<int64_t>(ParseUint64(value))));
     } else {

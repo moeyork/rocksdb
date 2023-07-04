@@ -1202,6 +1202,45 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
       // of a currently running compaction, we cannot run it.
       return false;
     }
+
+  if (start_level_ == 0) {
+    uint64_t total_keys = 0;
+    std::vector<HyperLogLog*> v;
+
+    if(true) {
+      const std::vector<FileMetaData*>& level_files = vstorage_->LevelFiles(0);
+      for (auto f : level_files) {
+        total_keys += f->hll_add_count;
+        v.push_back(f->hll.get());
+        //fprintf(stdout, "file=%ld %ld ", f->fd.GetNumber(), f->hll_add_count);
+      }
+    }
+
+    if (false) {
+    for (auto& input_level : compaction_inputs_) {
+      for (auto f : input_level.files) {
+        total_keys += f->hll_add_count;
+        v.push_back(f->hll.get());
+        //fprintf(stdout, "file=%ld %ld ", f->fd.GetNumber(), f->hll_add_count);
+      }
+    }
+    }
+
+    uint64_t estimated = HyperLogLog::MergedEstimate(v);
+    const double reclaim_ratio = 1 - estimated * 1.0 / total_keys;
+    //fprintf(stdout, "total=%ld estimated=%ld ratio=%f\n", total_keys, estimated, reclaim_ratio);
+    //if(total_keys > 2000) {fflush(stdout); int * p = 0; *p = 1;};
+    
+    if (reclaim_ratio < 0.4 && vstorage_->LevelFiles(start_level_).size() <= 4) {
+      fprintf(stdout, "delayed reclaim ratio=%f size=%d\n", reclaim_ratio, vstorage_->LevelFiles(start_level_).size());
+      return false;
+    }
+
+    //fprintf(stdout, "nodelayed reclaim ratio=%f size=%d\n", reclaim_ratio, vstorage->LevelFiles(level).size());
+  }
+
+
+
     compaction_picker_->GetGrandparents(vstorage_, start_level_inputs_,
                                         output_level_inputs_, &grandparents_);
   } else {

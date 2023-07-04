@@ -1031,6 +1031,10 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   log::Writer* new_log = nullptr;
   MemTable* new_mem = nullptr;
 
+  MemTable* new_mem_hot = nullptr;
+  MemTable* old_mem_cold = nullptr;
+  bool coldMapValid;
+
   // In case of pipelined write is enabled, wait for all pending memtable
   // writers.
   if (immutable_db_options_.enable_pipelined_write) {
@@ -1114,6 +1118,22 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
       new_superversion = new SuperVersion();
     }
 
+    SequenceNumber seq = versions_->LastSequence();
+    MemTable* cur_mem = cfd->mem();
+
+    new_mem_hot = cfd->ConstructNewMemtable(mutable_cf_options, seq);
+    old_mem_cold = cfd->ConstructNewMemtable(mutable_cf_options, seq);
+
+    ReadOptions read_options;
+    //coldMapValid = cur_mem->GetHotColdKeys(new_mem_hot, old_mem_cold, read_options);
+    
+    //old_mem_cold->Ref();
+    // PRINT printf("Switch Memtable: HotKeys size: %d\n", new_mem_hot->num_entries());
+    if(coldMapValid){
+      // PRINT printf("Switch Memtable: ColdKeys size: %d\n", old_mem_cold->num_entries());
+      old_mem_cold->Ref();
+    } 
+
 #ifndef ROCKSDB_LITE
     // PLEASE NOTE: We assume that there are no failable operations
     // after lock is acquired below since we are already notifying
@@ -1166,7 +1186,16 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   }
 
   cfd->mem()->SetNextLogNumber(logfile_number_);
+
+  // Disable flushing
+
   cfd->imm()->Add(cfd->mem(), &context->memtables_to_free_);
+  //if (coldMapValid){ 
+  //  old_mem_cold->SetNextLogNumber(logfile_number_);
+  //  cfd->imm()->Add(old_mem_cold, &context->memtables_to_free_);
+ // }
+
+  //new_mem = new_mem_hot;
   new_mem->Ref();
   cfd->SetMemtable(new_mem);
   context->superversions_to_free_.push_back(InstallSuperVersionAndScheduleWork(

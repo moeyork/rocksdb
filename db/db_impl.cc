@@ -169,6 +169,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
       unscheduled_flushes_(0),
       unscheduled_compactions_(0),
       bg_compaction_scheduled_(0),
+      bg_l0_compaction_scheduled_(0),
       num_running_compactions_(0),
       bg_flush_scheduled_(0),
       num_running_flushes_(0),
@@ -191,6 +192,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
       opened_successfully_(false),
       concurrent_prepare_(options.concurrent_prepare),
       manual_wal_flush_(options.manual_wal_flush) {
+
+
+        printf(">>>> DBImpl constructor low_pri_write_rate_limiter_\n");
   env_->GetAbsolutePath(dbname, &db_absolute_path_);
 
   // Reserve ten files or so for other uses and give the rest to TableCache.
@@ -956,22 +960,28 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
       done = true;
       pinnable_val->PinSelf();
       RecordTick(stats_, MEMTABLE_HIT);
+      // READ from Memtable
     } else if ((s.ok() || s.IsMergeInProgress()) &&
                sv->imm->Get(lkey, pinnable_val->GetSelf(), &s, &merge_context,
                             &range_del_agg, read_options)) {
       done = true;
       pinnable_val->PinSelf();
       RecordTick(stats_, MEMTABLE_HIT);
+      // READ from Immutable Memtable
     }
     if (!done && !s.ok() && !s.IsMergeInProgress()) {
       return s;
     }
   }
   if (!done) {
+    //s = Status::TryAgain(); // don't go to disk. See what happens with the latency
+    //return s;
     PERF_TIMER_GUARD(get_from_output_files_time);
     sv->current->Get(read_options, lkey, pinnable_val, &s, &merge_context,
                      &range_del_agg, value_found);
     RecordTick(stats_, MEMTABLE_MISS);
+    s = Status::TryAgain();
+    //READ from DISK <-- shouldn't do this. Should return and re-schedule in a different queue. 
   }
 
   {

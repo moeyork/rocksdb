@@ -43,6 +43,7 @@ struct ThreadStatus {
   // The type of a thread.
   enum ThreadType : int {
     HIGH_PRIORITY = 0,  // RocksDB BG thread in high-pri thread pool
+    MED_PRIORITY,  
     LOW_PRIORITY,  // RocksDB BG thread in low-pri thread pool
     USER,  // User thread (Non-RocksDB BG thread)
     NUM_THREAD_TYPES

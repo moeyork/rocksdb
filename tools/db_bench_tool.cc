@@ -31,6 +31,11 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <queue>
+#include <ctime>
+#include <ratio>
+#include <chrono>
+#include <unistd.h>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
@@ -69,6 +74,8 @@
 #include "utilities/blob_db/blob_db.h"
 #include "utilities/merge_operators.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+#include "util/zipf.h"
+#include "util/latest-generator.h"
 
 #ifdef OS_WIN
 #include <io.h>  // open/close
@@ -104,8 +111,25 @@ DEFINE_string(
     "readwhilewriting,"
     "readwhilemerging,"
     "readrandomwriterandom,"
+    "readrandomwriterandomdifferentvaluesizes,"
+    "readrandomwriterandomsplitrange,"
+    "readrandomwriterandomsplitrangedifferentvaluesizes,"
+    "readrandomwriterandomskewed,"
+    "readrandomwriterandomsplitrangeskewed,"
+    "differentvaluesizesperthread,"
+    "differentvaluesizesperthreadcomparison,"
+    "longpeak,"
+    "testzipf,"
+    "testlatestgenerator,"
+    "ycsbwklda,"
+    "ycsbwkldb,"
+    "ycsbwkldc,"
+    "ycsbwkldd,"
+    "ycsbwklde,"
+    "ycsbwkldf,"
     "updaterandom,"
     "randomwithverify,"
+    "readwriteskewedworkload,"
     "fill100K,"
     "crc32c,"
     "xxhash,"
@@ -184,12 +208,19 @@ DEFINE_string(
     "\theapprofile -- Dump a heap profile (if supported by this"
     " port)\n");
 
+DEFINE_int64(prob, 9900, " the threshold for the prob variable");
+
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
              "read/write on fewer keys so that gets are more likely to find the"
              " key and puts are more likely to update the same key");
+
+DEFINE_int64(datasize, 1000,
+             "Number of distinct keys to use. Used in ReadWriteSkewedWorkload to "
+             "indicate database size");
+
 
 DEFINE_int64(merge_keys, -1,
              "Number of distinct keys to use for MergeRandom and "
@@ -232,6 +263,10 @@ DEFINE_bool(reverse_iterator, false,
             "Seek and then Next");
 
 DEFINE_bool(use_uint64_comparator, false, "use Uint64 user comparator");
+
+DEFINE_bool(autotuned_rate_limiter, false, "Are we using RocksDB autotuned rate limiter or not");
+
+DEFINE_bool(dynamic_compaction_rate, false, "dynamically adjust compaction and flushing rate; used in FluctuatingThroughput tests");
 
 DEFINE_int64(batch_size, 1, "Batch size");
 
@@ -651,6 +686,8 @@ DEFINE_bool(report_bg_io_stats, false,
 DEFINE_bool(use_stderr_info_logger, false,
             "Write info logs to stderr instead of to LOG file. ");
 
+DEFINE_bool(YCSB_uniform_distribution, false, "Uniform key distribution for YCSB");
+
 static enum rocksdb::CompressionType StringToCompressionType(const char* ctype) {
   assert(ctype);
 
@@ -783,7 +820,7 @@ DEFINE_uint64(delayed_write_rate, 8388608u,
 DEFINE_bool(enable_pipelined_write, true,
             "Allow WAL and memtable writes to be pipelined");
 
-DEFINE_bool(allow_concurrent_memtable_write, true,
+DEFINE_bool(allow_concurrent_memtable_write, false,
             "Allow multi-writers to update mem tables in parallel.");
 
 DEFINE_bool(enable_write_thread_adaptive_yield, true,
@@ -800,6 +837,9 @@ DEFINE_uint64(write_thread_slow_yield_usec, 3,
 DEFINE_int32(rate_limit_delay_max_milliseconds, 1000,
              "When hard_rate_limit is set then this is the max time a put will"
              " be stalled.");
+
+DEFINE_int32(SILK_bandwidth_check_interval, 10000,
+             "How  much time to wait between sampling the bandwidth and adjusting compaction rate in SILK");
 
 DEFINE_uint64(rate_limiter_bytes_per_sec, 0, "Set options.rate_limiter value.");
 
@@ -1344,7 +1384,9 @@ class ReporterAgent {
 
 enum OperationType : unsigned char {
   kRead = 0,
+  kReadDisk,
   kWrite,
+  kWriteLarge,
   kDelete,
   kSeek,
   kMerge,
@@ -1359,7 +1401,9 @@ enum OperationType : unsigned char {
 static std::unordered_map<OperationType, std::string, std::hash<unsigned char>>
                           OperationTypeString = {
   {kRead, "read"},
+  {kReadDisk, "readDisk"},
   {kWrite, "write"},
+  {kWriteLarge, "writeLarge"},
   {kDelete, "delete"},
   {kSeek, "seek"},
   {kMerge, "merge"},
@@ -1485,6 +1529,137 @@ class Stats {
     last_op_finish_ = FLAGS_env->NowMicros();
   }
 
+
+  long FinishedOpsQUEUES(DBWithColumnFamilies* db_with_cfh, DB* db, int64_t num_ops, 
+                    uint64_t op_start_time, enum OperationType op_type = kOthers) { //num_ops is 1 
+    
+    long cur_ops_interval = 0;
+    if (reporter_agent_) {
+      reporter_agent_->ReportFinishedOps(num_ops);
+    }
+    if (FLAGS_histogram) {
+      uint64_t now = FLAGS_env->NowMicros();
+      uint64_t micros = now - op_start_time;
+
+      if (hist_.find(op_type) == hist_.end())
+      {
+        auto hist_temp = std::make_shared<HistogramImpl>();
+        hist_.insert({op_type, std::move(hist_temp)});
+      }
+      hist_[op_type]->Add(micros);
+
+      if (micros > 20000 && !FLAGS_stats_interval) {
+        fprintf(stderr, "long op: %" PRIu64 " micros%30s\r", micros, "");
+        fflush(stderr);
+      }
+      last_op_finish_ = now;
+    }
+
+    done_ += num_ops;
+    if (done_ >= next_report_) {
+      if (!FLAGS_stats_interval) {
+        if      (next_report_ < 1000)   next_report_ += 100;
+        else if (next_report_ < 5000)   next_report_ += 500;
+        else if (next_report_ < 10000)  next_report_ += 1000;
+        else if (next_report_ < 50000)  next_report_ += 5000;
+        else if (next_report_ < 100000) next_report_ += 10000;
+        else if (next_report_ < 500000) next_report_ += 50000;
+        else                            next_report_ += 100000;
+        fprintf(stderr, "... finished %" PRIu64 " ops%30s\r", done_, "");
+      } else {
+        uint64_t now = FLAGS_env->NowMicros();
+        int64_t usecs_since_last = now - last_report_finish_;
+
+        // Determine whether to print status where interval is either
+        // each N operations or each N seconds.
+
+        if (FLAGS_stats_interval_seconds &&
+            usecs_since_last < (FLAGS_stats_interval_seconds * 1000000)) {
+          // Don't check again for this many operations
+          next_report_ += FLAGS_stats_interval;
+
+        } else {
+
+          fprintf(stderr,
+                  "%s ... thread %d: (%" PRIu64 ",%" PRIu64 ") ops and "
+                  "(%.1f,%.1f) ops/second in (%.6f,%.6f) seconds\n",
+                  FLAGS_env->TimeToString(now/1000000).c_str(),
+                  id_,
+                  done_ - last_report_done_, done_,
+                  (done_ - last_report_done_) /
+                  (usecs_since_last / 1000000.0),
+                  done_ / ((now - start_) / 1000000.0),
+                  (now - last_report_finish_) / 1000000.0,
+                  (now - start_) / 1000000.0);
+
+          cur_ops_interval = (done_ - last_report_done_) /
+                  (usecs_since_last / 1000000.0);
+
+          for (auto it = hist_.begin(); it != hist_.end(); ++it) {
+
+                fprintf(stdout, "Microseconds per %s %d :\n%.200s\n",
+                OperationTypeString[it->first].c_str(), id_,
+                it->second->ToString().c_str());
+           }
+          
+          //TODO: maybe reset the histogram?
+
+          if (id_ == 1 && FLAGS_stats_per_interval) {
+            std::string stats;
+
+            if (db_with_cfh && db_with_cfh->num_created.load()) {
+              for (size_t i = 0; i < db_with_cfh->num_created.load(); ++i) {
+                if (db->GetProperty(db_with_cfh->cfh[i], "rocksdb.cfstats",
+                                    &stats))
+                  fprintf(stderr, "%s\n", stats.c_str());
+                if (FLAGS_show_table_properties) {
+                  for (int level = 0; level < FLAGS_num_levels; ++level) {
+                    if (db->GetProperty(
+                            db_with_cfh->cfh[i],
+                            "rocksdb.aggregated-table-properties-at-level" +
+                                ToString(level),
+                            &stats)) {
+                      if (stats.find("# entries=0") == std::string::npos) {
+                        fprintf(stderr, "Level[%d]: %s\n", level,
+                                stats.c_str());
+                      }
+                    }
+                  }
+                }
+              }
+            } else if (db) {
+              if (db->GetProperty("rocksdb.stats", &stats)) {
+                fprintf(stderr, "%s\n", stats.c_str());
+              }
+              if (FLAGS_show_table_properties) {
+                for (int level = 0; level < FLAGS_num_levels; ++level) {
+                  if (db->GetProperty(
+                          "rocksdb.aggregated-table-properties-at-level" +
+                              ToString(level),
+                          &stats)) {
+                    if (stats.find("# entries=0") == std::string::npos) {
+                      fprintf(stderr, "Level[%d]: %s\n", level, stats.c_str());
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          next_report_ += FLAGS_stats_interval;
+          last_report_finish_ = now;
+          last_report_done_ = done_;
+        }
+      }
+      if (id_ ==1 && FLAGS_thread_status_per_interval) {
+        PrintThreadStatus();
+      }
+      fflush(stderr);
+    }
+
+    return cur_ops_interval;
+  }
+
   void FinishedOps(DBWithColumnFamilies* db_with_cfh, DB* db, int64_t num_ops,
                    enum OperationType op_type = kOthers) {
     if (reporter_agent_) {
@@ -1545,7 +1720,16 @@ class Stats {
                   (now - last_report_finish_) / 1000000.0,
                   (now - start_) / 1000000.0);
 
-          if (id_ == 0 && FLAGS_stats_per_interval) {
+          for (auto it = hist_.begin(); it != hist_.end(); ++it) {
+
+                fprintf(stdout, "Microseconds per %s %d :\n%.200s\n",
+                OperationTypeString[it->first].c_str(), id_,
+                it->second->ToString().c_str());
+           }
+          
+          //TODO: maybe reset the histogram?
+
+          if (id_ == 1 && FLAGS_stats_per_interval) {
             std::string stats;
 
             if (db_with_cfh && db_with_cfh->num_created.load()) {
@@ -1592,7 +1776,7 @@ class Stats {
           last_report_done_ = done_;
         }
       }
-      if (id_ == 0 && FLAGS_thread_status_per_interval) {
+      if (id_ ==1 && FLAGS_thread_status_per_interval) {
         PrintThreadStatus();
       }
       fflush(stderr);
@@ -1752,6 +1936,12 @@ struct SharedState {
   long num_done;
   bool start;
 
+  std::queue<std::pair<int, std::chrono::microseconds>> op_queues[5][8]; //only used in QueuingMeasurements
+  int send_low_workload; //only used in FluctuatingThroughput test for generating high and low throughput
+  int peak_sleep_time; //only used in ProductionWorkloadTest test for generating high and low throughput
+  int high_peak; // used in LongPeakTest test for generating a high peak
+  long cur_ops_interval;
+
   SharedState() : cv(&mu), perf_level(FLAGS_perf_level) { }
 };
 
@@ -1760,8 +1950,13 @@ struct ThreadState {
   int tid;             // 0..n-1 when running in n threads
   Random64 rand;         // Has different seeds for different threads
   Stats stats;
+  
   SharedState* shared;
+  int last_thread_bucket1;//only used in QueuingMeasurements test for load generator thread
+  int last_thread_bucket2;//only used in QueuingMeasurements test for load generator thread
 
+  //int queue[1000000];
+  bool init =false;
   /* implicit */ ThreadState(int index)
       : tid(index),
         rand((FLAGS_seed ? FLAGS_seed : 1000) + index) {
@@ -1824,6 +2019,7 @@ class Benchmark {
   int64_t range_tombstone_width_;
   int64_t max_num_range_tombstones_;
   WriteOptions write_options_;
+  ColumnFamilyOptions col_fam_options_;
   Options open_options_;  // keep options around to properly destroy db later
   int64_t reads_;
   int64_t deletes_;
@@ -2268,6 +2464,7 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       exit(1);
     }
     Open(&open_options_);
+
     PrintHeader();
     std::stringstream benchmark_stream(FLAGS_benchmarks);
     std::string name;
@@ -2285,6 +2482,10 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       range_tombstone_width_ = FLAGS_range_tombstone_width;
       max_num_range_tombstones_ = FLAGS_max_num_range_tombstones;
       write_options_ = WriteOptions();
+      
+      col_fam_options_ = ColumnFamilyOptions();
+      col_fam_options_.inplace_update_support = true;
+
       read_random_exp_range_ = FLAGS_read_random_exp_range;
       if (FLAGS_sync) {
         write_options_.sync = true;
@@ -2428,7 +2629,39 @@ void VerifyDBFromDB(std::string& truth_db_name) {
         method = &Benchmark::ReadWhileMerging;
       } else if (name == "readrandomwriterandom") {
         method = &Benchmark::ReadRandomWriteRandom;
-      } else if (name == "readrandommergerandom") {
+      } else if (name == "readrandomwriterandomsplitrange") {
+        method = &Benchmark::ReadRandomWriteRandomSplitRange;
+      }else if (name == "readrandomwriterandomskewed") {
+        method = &Benchmark::ReadRandomWriteRandomSkewed;
+      } else if (name == "readrandomwriterandomsplitrangeskewed") {
+        method = &Benchmark::ReadRandomWriteRandomSplitRangeSkewed;
+      }else if (name == "differentvaluesizesperthread") {
+        method = &Benchmark::ReadRandomWriteRandomDifferentValueSizesPerThread;
+      }else if (name == "differentvaluesizesperthreadcomp") {
+        method = &Benchmark::ReadRandomWriteRandomDifferentValueSizesPerThreadComparison;
+      }else if (name == "longpeak") {
+        method = &Benchmark::LongPeakTest;
+      }else if (name == "testzipf") {
+        method = &Benchmark::Zipf;
+      }else if (name == "testlatestgenerator") {
+        method = &Benchmark::LatestGenerator;
+      }else if (name == "ycsbwklda") {
+        method = &Benchmark::YCSBWorkloadA;
+      }else if (name == "ycsbwkldb") {
+        method = &Benchmark::YCSBWorkloadB;
+      }else if (name == "ycsbwkldc") {
+        method = &Benchmark::YCSBWorkloadC;
+      }else if (name == "ycsbwkldd") {
+        method = &Benchmark::YCSBWorkloadD;
+      }else if (name == "ycsbwklde") {
+        method = &Benchmark::YCSBWorkloadE;
+      }else if (name == "ycsbwkldf") {
+        method = &Benchmark::YCSBWorkloadF;
+      }else if (name == "readrandomwriterandomdifferentvaluesizes") {
+        method = &Benchmark::ReadRandomWriteRandomDifferentValueSizes;
+      } else if (name == "readrandomwriterandomsplitrangedifferentvaluesizes") {
+        method = &Benchmark::ReadRandomWriteRandomSplitRangeDifferentValueSizes;
+      }else if (name == "readrandommergerandom") {
         if (FLAGS_merge_operator.empty()) {
           fprintf(stdout, "%-12s : skipped (--merge_operator is unknown)\n",
                   name.c_str());
@@ -2448,6 +2681,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
         method = &Benchmark::MergeRandom;
       } else if (name == "randomwithverify") {
         method = &Benchmark::RandomWithVerify;
+      } else if (name == "readwriteskewedworkload") {
+        method = &Benchmark::ReadWriteSkewedWorkload;
       } else if (name == "fillseekseq") {
         method = &Benchmark::WriteSeqSeekSeq;
       } else if (name == "compact") {
@@ -2600,12 +2835,15 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     shared.total = n;
     shared.num_initialized = 0;
     shared.num_done = 0;
+    shared.send_low_workload = 0;
     shared.start = false;
     if (FLAGS_benchmark_write_rate_limit > 0) {
+      printf(">>>> FLAGS_benchmark_write_rate_limit WRITE RATE LIMITER\n");  
       shared.write_rate_limiter.reset(
           NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
     }
     if (FLAGS_benchmark_read_rate_limit > 0) {
+       printf(">>>> FLAGS_benchmark_read_rate_limit READ RATE LIMITER\n");    
       shared.read_rate_limiter.reset(NewGenericRateLimiter(
           FLAGS_benchmark_read_rate_limit, 100000 /* refill_period_us */,
           10 /* fairness */, RateLimiter::Mode::kReadsOnly));
@@ -3180,11 +3418,21 @@ void VerifyDBFromDB(std::string& truth_db_name) {
                 "new_table_reader_for_compaction_inputs set\n");
         exit(1);
       }
+      printf(">>>> FLAGS_rate_limiter_bytes_per_sec RATE LIMITER\n");
+
+      if (FLAGS_autotuned_rate_limiter == true){
+        options.rate_limiter.reset(NewGenericRateLimiter(
+          FLAGS_rate_limiter_bytes_per_sec, 100 * 1000 /* refill_period_us */,
+          10 /* fairness */,
+          FLAGS_rate_limit_bg_reads ? RateLimiter::Mode::kReadsOnly
+                                    : RateLimiter::Mode::kWritesOnly));
+      } else{ 
       options.rate_limiter.reset(NewGenericRateLimiter(
           FLAGS_rate_limiter_bytes_per_sec, 100 * 1000 /* refill_period_us */,
           10 /* fairness */,
           FLAGS_rate_limit_bg_reads ? RateLimiter::Mode::kReadsOnly
                                     : RateLimiter::Mode::kWritesOnly));
+      }
     }
 
 #ifndef ROCKSDB_LITE
@@ -4291,6 +4539,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
 
     std::unique_ptr<RateLimiter> write_rate_limiter;
     if (FLAGS_benchmark_write_rate_limit > 0) {
+
+      printf (">>>> FLAGS_benchmark_write_rate_limit  BGWriter\n"); 
       write_rate_limiter.reset(
           NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
     }
@@ -4506,6 +4756,108 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     thread->stats.AddMessage(msg);
   }
 
+
+
+
+    // Differs from readrandomwriterandom in the following ways:
+  // (a) Uses GetMany/PutMany to read/write key values. Refer to those funcs.
+  // (b) Does deletes as well (per FLAGS_deletepercent)
+  // (c) In order to achieve high % of 'found' during lookups, and to do
+  //     multiple writes (including puts and deletes) it uses upto
+  //     FLAGS_numdistinct distinct keys instead of FLAGS_num distinct keys.
+  // (d) Does not have a MultiGet option.
+
+   void ReadWriteSkewedWorkload(ThreadState* thread) { // Workload FROM TRIAD 
+ 
+     ReadOptions options(FLAGS_verify_checksum, true);
+     RandomGenerator gen;
+     std::string value;
+     int64_t found = 0;
+     int get_weight = 0;
+     int put_weight = 0;
+     int delete_weight = 0;
+     int64_t gets_done = 0;
+     int64_t puts_done = 0;
+     int64_t deletes_done = 0;
+ 
+     std::unique_ptr<const char[]> key_guard;
+     Slice key = AllocateKey(&key_guard);
+ 
+     // the number of iterations is the larger of read_ or write_
+     printf("Op count: %lu\n", readwrites_);
+     for (int64_t i = 0; i < readwrites_; i++) {
+       DB* db = SelectDB(thread);
+       if (get_weight == 0 && put_weight == 0 && delete_weight == 0) {
+         // one batch completed, reinitialize for next batch
+         get_weight = FLAGS_readwritepercent;
+         delete_weight = FLAGS_deletepercent;
+         put_weight = 100 - get_weight - delete_weight;
+       }
+ 
+       // probability for skew; fix at 90%
+       uint32_t prob = thread->rand.Next() % 100;
+       uint32_t rand_key = thread->rand.Next();
+ 
+      std::string a;
+      if (prob <= 90){
+        rand_key = rand_key % FLAGS_numdistinct;
+        GenerateKeyFromInt(rand_key, FLAGS_numdistinct, &key);
+       } else{
+        rand_key = rand_key % FLAGS_datasize;
+        GenerateKeyFromInt(rand_key, FLAGS_datasize, &key);
+       }
+ 
+       a = std::to_string(rand_key);
+       a += '\0';
+       key = Slice(a.c_str()); 
+ 
+       if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+
+       if (!s.ok()) {
+          //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+           // we continue after error rather than exiting so that we can
+           // find more errors if any
+        } else if (!s.IsNotFound()) {
+           found++;
+        }
+         get_weight--;
+         gets_done++;
+         thread->stats.FinishedOps(&db_, db_.db, 1, kRead);
+        } else if (put_weight > 0) {
+         // then do all the corresponding number of puts
+         // for all the gets we have done earlier
+         
+         Status s = db->Put(write_options_, key, key);
+         if (!s.ok()) {
+           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+           exit(1);
+         }
+         put_weight--;
+         puts_done++;
+         thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
+        } else if (delete_weight > 0) {
+         Status s = db->Delete(write_options_, key);
+         if (!s.ok()) {
+           fprintf(stderr, "delete error: %s\n", s.ToString().c_str());
+           exit(1);
+         }
+         delete_weight--;
+         deletes_done++;
+         thread->stats.FinishedOps(&db_, db_.db, 1, kDelete);
+       }
+     }
+     char msg[100];
+     snprintf(msg, sizeof(msg),
+              "( get:%" PRIu64 " put:%" PRIu64 " del:%" PRIu64 " total:%" \
+              PRIu64 " found:%" PRIu64 ")",
+              gets_done, puts_done, deletes_done, readwrites_, found);
+     thread->stats.AddMessage(msg);
+   }
+
+
+
   // This is different from ReadWhileWriting because it does not use
   // an extra thread.
   void ReadRandomWriteRandom(ThreadState* thread) {
@@ -4563,6 +4915,1239 @@ void VerifyDBFromDB(std::string& truth_db_name) {
              reads_done, writes_done, readwrites_, found);
     thread->stats.AddMessage(msg);
   }
+
+
+// IMPORTANT: Need 15 threads for this to work: 
+// Thread 0 is the SILK thread -- adjust compaction bandwidth accordin to user workload. 
+// Threads 1 -- 8 are the worker threads who take stuff from queues
+// Threads 9 -- 13 are the workload generator threads
+// Thread 14 is the one that controls throughput fluctuations
+
+void LongPeakTest(ThreadState* thread) {
+    printf("Starting LongPeakTest test\n");
+
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    Duration duration(FLAGS_duration, readwrites_);
+    std::string value;
+    long vals_generated = 0;
+    long writes_done = 0;
+    long reads_done = 0;
+    int cur_queue = 0;
+    int workerthread = 1;
+    bool pausedcompaction = false;
+    long prev_bandwidth_compaction_MBPS = 0;
+
+    int steady_workload_time = 0;
+
+    while (!duration.Done(1)) {
+        DB* db = SelectDB(thread);
+        if (!thread->init){
+            if(thread->tid != 0 ){
+                //
+            } else {
+                thread->shared->high_peak = 0;
+                thread->shared->send_low_workload = 1;
+                thread->last_thread_bucket1 = 0;
+                thread->last_thread_bucket2 = 3;
+
+            }  
+            thread->init = true;
+        }
+
+
+        // thread tid=0 SILK thread. Responsible for dynamic compaction bandiwdth. 
+        
+        if (thread->tid == 0){
+            
+            // //check the current bandwidth for user operations 
+            long cur_throughput = thread->shared->cur_ops_interval * 8 ; // 8 worker threads
+            long cur_bandwidth_user_ops_MBPS = cur_throughput * FLAGS_value_size / 1000000;
+
+            // SILK TESTING the Pause compaction work functionality
+            if (!pausedcompaction && cur_bandwidth_user_ops_MBPS > 150){
+                //SILK Consider this a load peak
+                printf("->>>>??? Pausing compaction work from SILK\n");
+                db->PauseCompactionWork();
+                pausedcompaction = true;
+            } else if (pausedcompaction && cur_bandwidth_user_ops_MBPS <= 150) {
+                printf("->>>>??? Resuming compaction work from SILK\n");
+                db->ContinueCompactionWork();
+                pausedcompaction = false;
+            }
+
+
+            long cur_bandiwdth_compaction_MBPS = 200 - cur_bandwidth_user_ops_MBPS; //measured 200MB/s SSD bandwidth on XEON.
+            if (cur_bandiwdth_compaction_MBPS < 10) {
+                cur_bandiwdth_compaction_MBPS = 10;
+            }
+
+            if (FLAGS_dynamic_compaction_rate && 
+                abs(prev_bandwidth_compaction_MBPS - cur_bandiwdth_compaction_MBPS) >= 10 ){
+                printf("Adjust-compaction-rate; current-client-bandwidth: %d ops/s; Bandwidth-taken: %d MB/s; Left-for-compaction: %d\n", 
+                    cur_throughput, cur_bandwidth_user_ops_MBPS, cur_bandiwdth_compaction_MBPS);
+                //DB* db = SelectDB(thread);
+                db->GetOptions().rate_limiter->SetBytesPerSecond(cur_bandiwdth_compaction_MBPS * 1000 * 1000);
+                prev_bandwidth_compaction_MBPS = cur_bandiwdth_compaction_MBPS;
+            }
+
+            usleep(FLAGS_SILK_bandwidth_check_interval); // sleep 10ms by default
+        // END COMMENT TO TOGGLE SILK TESTING 
+
+        } else if (thread->tid > 8 && thread->tid < 14) {
+            //printf("I'm the load generator!\n");
+            //Generate a random number
+            int val_size = FLAGS_value_size;;
+            std::chrono::microseconds ms = std::chrono::duration_cast< std::chrono::milliseconds >
+                (std::chrono::system_clock::now().time_since_epoch());
+            
+            std::pair<int, std::chrono::microseconds> val_timestamp_tuple(val_size, ms);
+            thread->shared->op_queues[thread->tid - 9][workerthread].push(val_timestamp_tuple);        
+            workerthread = (workerthread + 1) % 8;
+
+            vals_generated++;
+
+            //std::this_thread::sleep_for(std::chrono::microseconds(200)); // equivalent to 5k request/s per load generating thread
+            
+            if(thread->shared->send_low_workload == 1){
+                usleep(700);
+            } else{
+                usleep(70);
+            }
+        
+        } else if (thread->tid == 14){
+          // throughput fluctuation thread.
+            
+            int sleep_time = 10000000;
+            if (steady_workload_time > 200){
+                if (thread->shared->send_low_workload == 1){
+                    thread->shared->send_low_workload = 0;
+                    printf("... thread 0 Switched to FAST workload\n");
+                    sleep_time = 50000000; // 50s peak
+                }
+                else{
+                    thread->shared->send_low_workload = 1;
+                    printf("... thread 0 Switched to SLOW workload\n");
+                    sleep_time = 10000000; // 10s time between peaks
+                }
+            }
+            steady_workload_time += 10;
+            
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_time)); //sleep for 10s
+            
+
+        }else {
+            //Worker thread
+            //if my queue isn't empty, I pop the first element and I perform an operation on the DB 
+            if (!thread->shared->op_queues[cur_queue][thread->tid - 1].empty()){
+                std::pair<int, std::chrono::microseconds> pair_val_time = 
+                    thread->shared->op_queues[cur_queue][thread->tid - 1].front();
+                thread->shared->op_queues[cur_queue][thread->tid - 1].pop();
+                std::chrono::microseconds out_of_queue_time = std::chrono::duration_cast< std::chrono::microseconds >
+                (std::chrono::system_clock::now().time_since_epoch());
+
+                std::unique_ptr<const char[]> key_guard;
+                Slice key = AllocateKey(&key_guard);
+
+                std::string a;
+                int rand_key = thread->rand.Next() % FLAGS_num;
+
+                //GenerateKeyFromInt(rand_key, FLAGS_num, &key);
+                a = std::to_string(rand_key);
+                a += '\0';
+                key = Slice(a.c_str()); 
+
+                int op_prob = thread->rand.Next() % 100;
+
+                if (op_prob < 50) {
+                    Status s = db->Put(write_options_, key, gen.Generate(pair_val_time.first));
+                    if (!s.ok()) {
+                        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+                        exit(1);
+                    }
+                    writes_done++;
+                    long curops = thread->stats.FinishedOpsQUEUES(nullptr, db, 1, (pair_val_time.second).count(), kWrite);
+                    if (curops != 0 && thread->tid == 1){
+                        thread->shared->cur_ops_interval = curops;
+                    }
+
+                } else{
+                    Status s = db->Get(options, key, &value);
+                    reads_done++;
+                    long curops =  thread->stats.FinishedOpsQUEUES(nullptr, db, 1, (pair_val_time.second).count(), kRead);
+                    if (curops != 0 && thread->tid == 1){
+                        thread->shared->cur_ops_interval = curops;
+                    }
+
+                }
+
+            }
+            cur_queue = (cur_queue + 1)%5;
+
+        }
+    }
+
+}
+
+
+
+//The idea of this test is that each thread has a different key/value size assigned
+//The range isn't split, so the reads aren't split by key/value size among threads. 
+// THIS TEST CAN ONLY BE RUN WITH 8 THREADS (for now).
+void ReadRandomWriteRandomDifferentValueSizesPerThread(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t ops_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    int value_sizes_per_thread[8];
+    value_sizes_per_thread[0] = 1;
+    value_sizes_per_thread[1] = 10;
+    value_sizes_per_thread[2] = 50;
+    value_sizes_per_thread[3] = 100;
+    value_sizes_per_thread[4] = 200;
+    value_sizes_per_thread[5] = 500;
+    value_sizes_per_thread[6] = 1000;
+    value_sizes_per_thread[7] = 1000000;
+
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+
+      if (ops_done % 10000 == 0){
+        printf("Ops done : %lu, thread: %d\n", ops_done, thread->tid);
+      }
+      DB* db = SelectDB(thread);
+      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        reads_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+
+        //The generate function takes the value size in bytes.
+        //In this test have values randomly fluctuate between 255B and 32000B
+        // In this test, the value size is different depending on what thread is writing. 
+
+        //printf("Size %d, thread %d\n", value_size_random, thread->tid);
+        Status s = db->Put(write_options_, key, gen.Generate(value_sizes_per_thread[thread->tid]));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+  //The idea of this test is that each thread has a different key/value size assigned
+//The range isn't split, so the reads aren't split by key/value size among threads. 
+void ReadRandomWriteRandomDifferentValueSizesPerThreadComparison(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t ops_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    int value_sizes_per_thread[8];
+    value_sizes_per_thread[0] = 1;
+    value_sizes_per_thread[1] = 10;
+    value_sizes_per_thread[2] = 50;
+    value_sizes_per_thread[3] = 100;
+    value_sizes_per_thread[4] = 200;
+    value_sizes_per_thread[5] = 500;
+    value_sizes_per_thread[6] = 1000;
+    value_sizes_per_thread[7] = 1000000;
+
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+
+        if (ops_done % 10000 == 0){
+            printf("Thread %d, ops %lu", thread->tid, ops_done);
+        }
+
+      DB* db = SelectDB(thread);
+      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        reads_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+
+        //The generate function takes the value size in bytes.
+        //In this test have values randomly fluctuate between 255B and 32000B
+        // In this test, the value size is different depending on what thread is writing. 
+
+        //printf("Size %d, thread %d\n", value_size_random, thread->tid);
+        Status s = db->Put(write_options_, key, gen.Generate(value_sizes_per_thread[thread->rand.Next()%8]));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+
+
+  void ReadRandomWriteRandomDifferentValueSizes(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t ops_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+
+      if (ops_done % 5000 == 0){
+        printf("Ops done : %lu, thread: %d\n", ops_done, thread->tid);
+      }
+      DB* db = SelectDB(thread);
+      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        reads_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+
+        //The generate function takes the value size in bytes.
+        //In this test have values randomly fluctuate between 255B and 255000B
+        int value_size_random = 255 + (thread->rand.Next() % (200000 - 255));
+        //printf("Size %d, thread %d\n", value_size_random, thread->tid);
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_random));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+    // This is different from ReadWhileWriting because it does not use
+  // an extra thread.
+  void ReadRandomWriteRandomSkewed(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+
+      //Allocate disjoint key ranges to threads
+      int hot_range = FLAGS_num / 10;
+      int prob_skewed = thread->rand.Next() % 100;
+      if (prob_skewed > 10) { 
+        // pick from hot range
+        GenerateKeyFromInt(thread->rand.Next() % hot_range, FLAGS_num, &key);
+
+      } else {
+        // pick from cold range
+        GenerateKeyFromInt( hot_range +
+            (thread->rand.Next() % (FLAGS_num - hot_range)), FLAGS_num, &key);
+
+      }
+
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+  //Like ReadRandomWriteRandom, but where the key range is split per thread
+  void ReadRandomWriteRandomSplitRange(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+      
+      //Allocate disjoint key ranges to threads
+      int key_range = FLAGS_num/FLAGS_threads;
+      int lower_bound = thread->tid * key_range;
+      GenerateKeyFromInt( lower_bound + (thread->rand.Next() % key_range), FLAGS_num, &key);
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+
+void ReadRandomWriteRandomSplitRangeDifferentValueSizes(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t ops_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      if (ops_done % 5000 == 0){
+        printf("Ops done : %lu, thread: %d\n", ops_done, thread->tid);
+      }
+      DB* db = SelectDB(thread);
+      
+      //Allocate disjoint key ranges to threads
+      int key_range = FLAGS_num/FLAGS_threads;
+      int lower_bound = thread->tid * key_range;
+      GenerateKeyFromInt( lower_bound + (thread->rand.Next() % key_range), FLAGS_num, &key);
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          ops_done++;
+        }
+        get_weight--;
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+        //The generate function takes the value size in bytes.
+        //In this test have values randomly fluctuate between 255B and 255000B
+        int value_size_random = 255 + (thread->rand.Next() % (255000 - 255));
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_random));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        ops_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+   void YCSBFillDB(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    // the number of iterations is the larger of read_ or write_
+
+    //write in order
+    for (long k = 1; k <= FLAGS_num; k++){
+      DB* db = SelectDB(thread);
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+        //write
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          //exit(1);
+        }
+        writes_done++;
+        //printf("K= %d\n", k);
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+    }    
+      
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+   // Workload A: Update heavy workload
+  // This workload has a mix of 50/50 reads and writes. 
+  // An application example is a session store recording recent actions.
+  // Read/update ratio: 50/50
+  // Default data size: 1 KB records 
+  // Request distribution: zipfian
+  void YCSBWorkloadA(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num);
+    
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    if (FLAGS_benchmark_write_rate_limit > 0) {
+       printf(">>>> FLAGS_benchmark_write_rate_limit YCSBA \n");
+      thread->shared->write_rate_limiter.reset(
+          NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
+    }
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+       
+          long k;
+          if (FLAGS_YCSB_uniform_distribution){
+            //Generate number from uniform distribution            
+            k = thread->rand.Next() % FLAGS_num;
+          } else { //default
+            //Generate number from zipf distribution
+            k = nextValue() % FLAGS_num;            
+          }
+          GenerateKeyFromInt(k, FLAGS_num, &key);
+
+          int next_op = thread->rand.Next() % 100;
+          if (next_op < 50){
+            //read
+            Status s = db->Get(options, key, &value);
+            if (!s.ok() && !s.IsNotFound()) {
+              //fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+              //exit(1);
+              // we continue after error rather than exiting so that we can
+              // find more errors if any
+            } else if (!s.IsNotFound()) {
+              found++;
+              thread->stats.FinishedOps(nullptr, db, 1, kRead);
+            }
+            reads_done++;
+            
+          } else{
+            //write
+            if (FLAGS_benchmark_write_rate_limit > 0) {
+                
+                thread->shared->write_rate_limiter->Request(
+                    value_size_ + key_size_, Env::IO_HIGH,
+                    nullptr /* stats */, RateLimiter::OpType::kWrite);
+                thread->stats.ResetLastOpTime();
+            }
+            Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+            if (!s.ok()) {
+              //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+              //exit(1);
+            } else{
+             writes_done++;
+             thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+            }                
+      }
+
+
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+
+  // Workload B: Read mostly workload
+  // This workload has a 95/5 reads/write mix. 
+  // Application example: photo tagging; add a tag is an update, 
+  // but most operations are to read tags.
+
+  // Read/update ratio: 95/5
+  // Default data size: 1 KB records 
+  // Request distribution: zipfian
+  void YCSBWorkloadB(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num);
+
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution){
+        //Generate number from uniform distribution            
+        k = thread->rand.Next() % FLAGS_num;
+      } else { //default
+        //Generate number from zipf distribution
+        k = nextValue() % FLAGS_num;            
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95){
+        //read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+        
+      } else{
+        //write
+        Status s = db->Get(options, key, &value);
+        s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          //exit(1);
+        } else{
+            writes_done++;
+            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload C: Read only
+  // This workload is 100% read. Application example: user profile cache, 
+  // where profiles are constructed elsewhere (e.g., Hadoop).
+  // Read/update ratio: 100/0
+  // Default data size: 1 KB records 
+  // Request distribution: zipfian
+  void YCSBWorkloadC(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num);
+
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution){
+        //Generate number from uniform distribution            
+        k = thread->rand.Next() % FLAGS_num;
+      } else { //default
+        //Generate number from zipf distribution
+        k = nextValue() % FLAGS_num;            
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      //read
+      Status s = db->Get(options, key, &value);
+      if (!s.ok() && !s.IsNotFound()) {
+        fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+        // we continue after error rather than exiting so that we can
+        // find more errors if any
+      } else if (!s.IsNotFound()) {
+        found++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      }
+      reads_done++;
+      
+      //std::cout << k << "\n";
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+
+  // Workload D: Read latest workload
+  // In this workload, new records are inserted, and the most recently 
+  // inserted records are the most popular. Application example: 
+  // user status updates; people want to read the latest.
+  
+  // Read/update/insert ratio: 95/0/5
+  // Default data size: 1 KB records 
+  // Request distribution: latest
+
+  // The insert order for this is hashed, not ordered. The "latest" items may be 
+  // scattered around the keyspace if they are keyed by userid.timestamp. A workload
+  // which orders items purely by time, and demands the latest, is very different than 
+  // workload here (which we believe is more typical of how people build systems.)
+  void YCSBWorkloadD(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num);
+
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution){
+        //Generate number from uniform distribution            
+        k = thread->rand.Next() % FLAGS_num;
+      } else { //default
+        //Generate number from latest distribution
+        k = next_value_latestgen() % FLAGS_num;           
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95){
+        //read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+        
+      } else{
+        //write
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          //exit(1);
+        } else{
+            writes_done++;
+            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+    
+  }
+
+  // Workload E: Short ranges. 
+  // In this workload, short ranges of records are queried,
+  // instead of individual records. Application example: 
+  // threaded conversations, where each scan is for the posts 
+  // in a given thread (assumed to be clustered by thread id).
+  
+  // Scan/insert ratio: 95/5
+  // Default data size: 1 KB records 
+  // Request distribution: latest
+  // Scan Length Distribution=uniform
+  // Max scan length = 100
+
+  // The insert order is hashed, not ordered. Although the scans are ordered, it does not necessarily
+  // follow that the data is inserted in order. For example, posts for thread 
+  // 342 may not be inserted contiguously, but
+  // instead interspersed with posts from lots of other threads. The way the YCSB 
+  // client works is that it will pick a start
+  // key, and then request a number of records; this works fine even for hashed insertion.
+  void YCSBWorkloadE(ThreadState* thread) {
+
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num);
+    
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution){
+        //Generate number from uniform distribution            
+        k = thread->rand.Next() % FLAGS_num;
+      } else { //default
+        //Generate number from zipf distribution
+        k = nextValue() % FLAGS_num;            
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95){
+        //scan
+        
+        //TODO need to draw a random number for the scan length
+        //for now, scan lenght constant
+        int scan_length = thread->rand.Next() % 100;
+
+        Iterator* iter = db->NewIterator(options);
+        int64_t i = 0;
+        int64_t bytes = 0;
+        for (iter->Seek(key); i < 100 && iter->Valid(); iter->Next()) {
+          bytes += iter->key().size() + iter->value().size();
+          //thread->stats.FinishedOps(nullptr, db, 1, kRead);
+          ++i;
+
+        }
+
+        delete iter;
+
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else{
+        //write
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          //exit(1);
+        } else{
+            writes_done++;
+            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+
+    
+  }
+
+  
+  // Workload F: Read-modify-write workload
+  // In this workload, the client will read a record, 
+  // modify it, and write back the changes. Application 
+  // example: user database, where user records are read 
+  // and modified by the user or to record user activity.
+
+  // Read/read-modify-write ratio: 50/50
+  // Default data size: 1 KB records 
+  // Request distribution: zipfian
+
+  void YCSBWorkloadF(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num);
+
+    std::string value;
+    int64_t found = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution){
+        //Generate number from uniform distribution            
+        k = thread->rand.Next() % FLAGS_num;
+      } else { //default
+        //Generate number from zipf distribution
+        k = nextValue() % FLAGS_num;            
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 50){
+        //read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+        
+      } else{
+        //read-modify-write.
+        Status s = db->Get(options, key, &value);
+        s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          //exit(1);
+        } else{
+            writes_done++;
+            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+
+    } 
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+  void LatestGenerator(ThreadState* thread){
+    printf("Latest Generator distribution test\n");
+    // Need a zipf generator
+    init_zipf_generator(0, 50);
+    init_latestgen(50);
+
+    for (int i=0; i<100; i++){
+        printf("%ld\n", next_value_latestgen() );
+    }
+
+  }
+
+  void Zipf(ThreadState* thread) {
+    printf("ZIPF distribution test\n");
+    init_zipf_generator(0, 1000);
+    long vect[1000];
+    for (int i = 0; i<1000; i++){
+        vect[i] = 0;
+    }
+    for (int i = 0; i <= 10000; i++){
+        vect[nextValue()] += 1;
+    }
+    for (int i = 0; i < 1000; i++){
+        printf ("%ld\n", vect[i]);
+    }
+  }
+
+  //Like ReadRandomWriteRandom, but where the key range is split per thread
+  //There is also a 90-10 skew (10% of data is accessed 90% of the time)
+  void ReadRandomWriteRandomSplitRangeSkewed(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+      
+      //Allocate disjoint key ranges to threads
+      int key_range = FLAGS_num/FLAGS_threads;
+      int hot_range = key_range / 10;
+      int lower_bound = thread->tid * key_range;
+
+      int prob_skewed = thread->rand.Next() % 100;
+      if (prob_skewed > 10) { 
+        // pick from hot range
+        GenerateKeyFromInt( lower_bound + (thread->rand.Next() % hot_range), FLAGS_num, &key);
+
+      } else {
+        // pick from cold range
+        GenerateKeyFromInt( lower_bound + hot_range + 
+            (thread->rand.Next() % (key_range - hot_range)), FLAGS_num, &key);
+
+      }
+
+      if (get_weight == 0 && put_weight == 0) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        put_weight = 100 - get_weight;
+      }
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+
 
   //
   // Read-modify-write for random keys
@@ -5050,6 +6635,7 @@ void VerifyDBFromDB(std::string& truth_db_name) {
 
     std::unique_ptr<RateLimiter> write_rate_limiter;
     if (FLAGS_benchmark_write_rate_limit > 0) {
+      printf(">>>> FLAGS_benchmark_write_rate_limit TimeSeriesWrite\n");
       write_rate_limiter.reset(
           NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
     }
@@ -5256,7 +6842,13 @@ int db_bench_tool(int argc, char** argv) {
     FLAGS_stats_interval = 1000;
   }
 
+  printf("HLL-%d", FLAGS_prob);
+
   rocksdb::Benchmark benchmark;
+  // Initialize the zipf distribution for YCSB
+  init_zipf_generator(0, FLAGS_num);
+  init_latestgen(FLAGS_num);
+
   benchmark.Run();
   return 0;
 }

@@ -137,6 +137,7 @@ LIB_SOURCES =                                                   \
   util/filename.cc                                              \
   util/filter_policy.cc                                         \
   util/hash.cc                                                  \
+  util/hyperloglog.cc                                           \
   util/log_buffer.cc                                            \
   util/murmurhash.cc                                            \
   util/random.cc                                                \
@@ -151,6 +152,8 @@ LIB_SOURCES =                                                   \
   util/threadpool_imp.cc                                        \
   util/transaction_test_util.cc                                 \
   util/xxhash.cc                                                \
+  util/zipf.cc 													\
+  util/latest-generator.cc 										\
   utilities/backupable/backupable_db.cc                         \
   utilities/blob_db/blob_db.cc                                  \
   utilities/blob_db/blob_db_impl.cc                             \
