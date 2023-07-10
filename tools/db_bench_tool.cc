@@ -31,6 +31,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <bitset>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
@@ -106,6 +107,7 @@ DEFINE_string(
     "readrandomwriterandom,"
     "updaterandom,"
     "randomwithverify,"
+    "readwriteskewedworkload,"
     "fill100K,"
     "crc32c,"
     "xxhash,"
@@ -186,10 +188,16 @@ DEFINE_string(
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
+DEFINE_int64(prob, 5000, " the threshold for the prob variable");
+
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
              "read/write on fewer keys so that gets are more likely to find the"
              " key and puts are more likely to update the same key");
+
+DEFINE_int64(datasize, 1000,
+             "Number of distinct keys to use. Used in ReadWriteSkewedWorkload to "
+             "indicate database size");
 
 DEFINE_int64(merge_keys, -1,
              "Number of distinct keys to use for MergeRandom and "
@@ -989,8 +997,8 @@ static const bool FLAGS_readwritepercent_dummy __attribute__((unused)) =
 DEFINE_int32(disable_seek_compaction, false,
              "Not used, left here for backwards compatibility");
 
-static const bool FLAGS_deletepercent_dummy __attribute__((unused)) =
-    RegisterFlagValidator(&FLAGS_deletepercent, &ValidateInt32Percent);
+//static const bool FLAGS_deletepercent_dummy __attribute__((unused)) =
+//    RegisterFlagValidator(&FLAGS_deletepercent, &ValidateInt32Percent);
 static const bool FLAGS_table_cache_numshardbits_dummy __attribute__((unused)) =
     RegisterFlagValidator(&FLAGS_table_cache_numshardbits,
                           &ValidateTableCacheNumshardbits);
@@ -1824,6 +1832,7 @@ class Benchmark {
   int64_t range_tombstone_width_;
   int64_t max_num_range_tombstones_;
   WriteOptions write_options_;
+  ColumnFamilyOptions col_fam_options_;
   Options open_options_;  // keep options around to properly destroy db later
   int64_t reads_;
   int64_t deletes_;
@@ -2183,8 +2192,8 @@ class Benchmark {
   //   |        key 00000         |
   //   ----------------------------
   void GenerateKeyFromInt(uint64_t v, int64_t num_keys, Slice* key) {
-    char* start = const_cast<char*>(key->data());
-    char* pos = start;
+    uint64_t* start = (uint64_t*)(key->data());
+    uint64_t* pos = start;
     if (keys_per_prefix_ > 0) {
       int64_t num_prefix = num_keys / keys_per_prefix_;
       int64_t prefix = v % num_prefix;
@@ -2204,17 +2213,37 @@ class Benchmark {
     }
 
     int bytes_to_fill = std::min(key_size_ - static_cast<int>(pos - start), 8);
+    
     if (port::kLittleEndian) {
+
       for (int i = 0; i < bytes_to_fill; ++i) {
-        pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+
+        pos[bytes_to_fill - i -1] = 0x00000000;
+        uint64_t x = (v >> (8*i)) & 0x000000ff;
+        pos[bytes_to_fill - i -1] = (x & 0x000000ff); 
       }
+
     } else {
       memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
     }
+
     pos += bytes_to_fill;
     if (key_size_ > pos - start) {
       memset(pos, '0', key_size_ - (pos - start));
     }
+
+  }
+
+  uint64_t IntKeyFromSlice(Slice* key){
+    uint64_t* data = (uint64_t*)key->data();
+    uint64_t key_integer = 0;
+    uint64_t radix = 1;
+    for (int i = key_size_ - 1 ; i >= 0; --i) {   
+        key_integer += radix * uint64_t(data[i]);
+        radix *= 256;
+    }
+    //printf("\n Integer conversion  ::::%lu:::: \n", key_integer);
+    return key_integer;
   }
 
   std::string GetPathForMultiple(std::string base_name, size_t id) {
@@ -2267,6 +2296,7 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     if (!SanityCheck()) {
       exit(1);
     }
+    std::cout << "Run!!\n";
     Open(&open_options_);
     PrintHeader();
     std::stringstream benchmark_stream(FLAGS_benchmarks);
@@ -2285,6 +2315,10 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       range_tombstone_width_ = FLAGS_range_tombstone_width;
       max_num_range_tombstones_ = FLAGS_max_num_range_tombstones;
       write_options_ = WriteOptions();
+
+      col_fam_options_ = ColumnFamilyOptions();
+      col_fam_options_.inplace_update_support = true;
+
       read_random_exp_range_ = FLAGS_read_random_exp_range;
       if (FLAGS_sync) {
         write_options_.sync = true;
@@ -2448,6 +2482,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
         method = &Benchmark::MergeRandom;
       } else if (name == "randomwithverify") {
         method = &Benchmark::RandomWithVerify;
+      } else if (name == "readwriteskewedworkload") {
+        method = &Benchmark::ReadWriteSkewedWorkload;
       } else if (name == "fillseekseq") {
         method = &Benchmark::WriteSeqSeekSeq;
       } else if (name == "compact") {
@@ -4506,6 +4542,111 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     thread->stats.AddMessage(msg);
   }
 
+  void ReadWriteSkewedWorkload(ThreadState* thread) {
+    // col_fam_options_ = ColumnFamilyOptions();
+    // col_fam_options_.inplace_update_support = true;
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    
+    std::string value;
+    int64_t found = 0;
+    int get_weight = 0;
+    int put_weight = 0;
+    //int delete_weight = 0;
+    int64_t gets_done = 0;
+    int64_t puts_done = 0;
+    //int64_t deletes_done = 0;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    // the number of iterations is the larger of read_ or write_
+    printf("Op count: %lu\n", readwrites_);
+    for (int64_t i = 0; i < readwrites_; i++) {
+
+      DB* db = SelectDB(thread);
+      //if (get_weight == 0 && put_weight == 0 && delete_weight == 0) 
+      if (get_weight == 0 && put_weight == 0 ) {
+        // one batch completed, reinitialize for next batch
+        get_weight = FLAGS_readwritepercent;
+        //delete_weight = FLAGS_deletepercent;
+        //put_weight = 100 - get_weight - delete_weight;
+        put_weight = 100 - get_weight;
+      }
+
+      // probability for skew; fix at 90%
+      uint32_t prob = thread->rand.Next() % 10000;
+      uint32_t rand_key = thread->rand.Next();
+
+
+      std::string a;
+
+      if (prob <= FLAGS_prob){
+        rand_key = rand_key % FLAGS_numdistinct;
+        //GenerateKeyFromInt(rand_key, FLAGS_numdistinct, &key);
+      } else{
+        rand_key = FLAGS_numdistinct + (rand_key % (FLAGS_datasize - FLAGS_numdistinct) );
+        //GenerateKeyFromInt(rand_key, FLAGS_datasize, &key);
+      }
+
+      a = std::to_string(rand_key);
+      a += '\0';
+      key = Slice(a.c_str()); 
+      //std::cout << "Test KEY: [Slice:"<< std::string(key.data()) << "];[String:" << a << "]\n";
+
+
+      if (get_weight > 0) {
+        // do all the gets first
+        Status s = db->Get(options, key, &value);
+        if (!s.ok()) {
+          //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        get_weight--;
+        gets_done++;
+        thread->stats.FinishedOps(&db_, db_.db, 1, kRead);
+      } else if (put_weight > 0) {
+        // then do all the corresponding number of puts
+        // for all the gets we have done earlier
+        
+        Status s = db->Put(write_options_, key, gen.Generate(value_size_));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        }
+        put_weight--;
+        puts_done++;
+        thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
+    }
+      //  else if (delete_weight > 0) {
+      //   Status s = db->Delete(write_options_, key);
+      //   if (!s.ok()) {
+      //     fprintf(stderr, "delete error: %s\n", s.ToString().c_str());
+      //     exit(1);
+      //   }
+      //   delete_weight--;
+      //   deletes_done++;
+      //   thread->stats.FinishedOps(&db_, db_.db, 1, kDelete);
+      // }
+    }
+    char msg[100];
+    // snprintf(msg, sizeof(msg),
+    //          "( get:%" PRIu64 " put:%" PRIu64 " del:%" PRIu64 " total:%" 
+    //          PRIu64 " found:%" PRIu64 ")",
+    //          gets_done, puts_done, deletes_done, readwrites_, found);
+
+    snprintf(msg, sizeof(msg),
+             "( get:%" PRIu64 " put:%" PRIu64 " total:%" \
+             PRIu64 " found:%" PRIu64 ")",
+             gets_done, puts_done, readwrites_, found);
+    thread->stats.AddMessage(msg);
+  }
+
+
+
   // This is different from ReadWhileWriting because it does not use
   // an extra thread.
   void ReadRandomWriteRandom(ThreadState* thread) {
@@ -5255,6 +5396,8 @@ int db_bench_tool(int argc, char** argv) {
     // at which the timer is checked for FLAGS_stats_interval_seconds
     FLAGS_stats_interval = 1000;
   }
+
+  printf("HOT COLD HLL\n");
 
   rocksdb::Benchmark benchmark;
   benchmark.Run();

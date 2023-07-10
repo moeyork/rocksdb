@@ -65,8 +65,10 @@ class CompactionIterator {
                      const Compaction* compaction = nullptr,
                      const CompactionFilter* compaction_filter = nullptr,
                      CompactionEventListener* compaction_listener = nullptr,
-                     const std::atomic<bool>* shutting_down = nullptr);
-
+                     const std::atomic<bool>* shutting_down = nullptr,
+                     LogBuffer* log_buffer = nullptr,
+                     const EnvOptions* env_options = nullptr,
+                     const std::string* dbname = nullptr); //HUAPENG
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, const Comparator* cmp,
                      MergeHelper* merge_helper, SequenceNumber last_sequence,
@@ -77,7 +79,10 @@ class CompactionIterator {
                      std::unique_ptr<CompactionProxy> compaction,
                      const CompactionFilter* compaction_filter = nullptr,
                      CompactionEventListener* compaction_listener = nullptr,
-                     const std::atomic<bool>* shutting_down = nullptr);
+                     const std::atomic<bool>* shutting_down = nullptr,
+                     LogBuffer* log_buffer = nullptr,
+                     const EnvOptions* env_options = nullptr,
+                     const std::string* dbname = nullptr); //HUAPENG
 
   ~CompactionIterator();
 
@@ -96,6 +101,7 @@ class CompactionIterator {
   // Getters
   const Slice& key() const { return key_; }
   const Slice& value() const { return value_; }
+  int level() {return level_;} //HUAPENG
   const Status& status() const { return status_; }
   const ParsedInternalKey& ikey() const { return ikey_; }
   bool Valid() const { return valid_; }
@@ -152,6 +158,9 @@ class CompactionIterator {
   // The status is OK unless compaction iterator encounters a merge operand
   // while not having a merge operator defined.
   Status status_;
+
+  int level_ = -1;//HUAPENG
+
   // Stores the user key, sequence number and type of the current compaction
   // iterator output (or current key in the underlying iterator during
   // NextFromInput()).
@@ -193,5 +202,13 @@ class CompactionIterator {
     // This is a best-effort facility, so memory_order_relaxed is sufficient.
     return shutting_down_ && shutting_down_->load(std::memory_order_relaxed);
   }
+
+  //HUAPENG
+  const EnvOptions* env_options_;
+  char buf[512];
+  std::unordered_map<std::string, std::shared_ptr<RandomAccessFileReader>> log_name_reader_map_;
+  std::string absolute_path_;
+  //END HUAPENG
+
 };
 }  // namespace rocksdb

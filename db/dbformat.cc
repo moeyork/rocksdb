@@ -15,6 +15,9 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include "monitoring/perf_context_imp.h"
+#include <iostream>
+#include <bitset>
+
 #include "port/port.h"
 #include "util/coding.h"
 #include "util/string_util.h"
@@ -33,7 +36,11 @@ const ValueType kValueTypeForSeekForPrev = kTypeDeletion;
 uint64_t PackSequenceAndType(uint64_t seq, ValueType t) {
   assert(seq <= kMaxSequenceNumber);
   assert(IsExtendedValueType(t));
-  return (seq << 8) | t;
+
+  uint64_t tmp = (seq << 8) | t;
+  std::bitset<64> binary_tmp(tmp);
+
+  return tmp;
 }
 
 void UnPackSequenceAndType(uint64_t packed, uint64_t* seq, ValueType* t) {
@@ -156,6 +163,7 @@ void InternalKeyComparator::FindShortSuccessor(std::string* key) const {
 
 LookupKey::LookupKey(const Slice& _user_key, SequenceNumber s) {
   size_t usize = _user_key.size();
+
   size_t needed = usize + 13;  // A conservative estimate
   char* dst;
   if (needed <= sizeof(space_)) {
@@ -167,11 +175,15 @@ LookupKey::LookupKey(const Slice& _user_key, SequenceNumber s) {
   // NOTE: We don't support users keys of more than 2GB :)
   dst = EncodeVarint32(dst, static_cast<uint32_t>(usize + 8));
   kstart_ = dst;
+  
   memcpy(dst, _user_key.data(), usize);
   dst += usize;
+
   EncodeFixed64(dst, PackSequenceAndType(s, kValueTypeForSeek));
   dst += 8;
   end_ = dst;
+
+  
 }
 
 }  // namespace rocksdb

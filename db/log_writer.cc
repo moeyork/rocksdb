@@ -14,6 +14,7 @@
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/file_reader_writer.h"
+#include "util/io_posix.h"
 
 namespace rocksdb {
 namespace log {
@@ -35,13 +36,32 @@ Writer::~Writer() { WriteBuffer(); }
 
 Status Writer::WriteBuffer() { return dest_->Flush(); }
 
-Status Writer::AddRecord(const Slice& slice) {
+Status Writer::AddRecord(const Slice& slice) {  
+  //HUAPENG
+   std::string fn;
+   int32_t offset;
+
+   return AddRecord(slice, fn, offset);
+}
+
+
+Status Writer::AddRecord(const Slice& slice, std::string& fn, int32_t& offset) {
+//END HUAPENG
   const char* ptr = slice.data();
   size_t left = slice.size();
 
   // Header size varies depending on whether we are recycling or not.
   const int header_size =
       recycle_log_files_ ? kRecyclableHeaderSize : kHeaderSize;
+
+  //HUAPENG
+  WritableFile* wf = dest_->writable_file();
+  if (PosixWritableFile* pwf = dynamic_cast<PosixWritableFile*>(wf)) {
+    fn = pwf->GetFileName();
+  }
+  offset = header_size + dest_->GetFileSize();
+
+  //END HUAPENG    
 
   // Fragment the record if necessary and emit it.  Note that if slice
   // is empty, we still want to iterate once to emit a single

@@ -222,6 +222,11 @@ __attribute__((__no_sanitize__("undefined")))
 __attribute__((__no_sanitize_undefined__))
 #endif
 #endif
+inline bool operator<(const Slice& x, const Slice& y) {
+  return x.compare(y) < 0;
+}
+
+
 inline int Slice::compare(const Slice& b) const {
   const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
   assert((data_ != nullptr && b.data_ != nullptr) || min_len == 0);

@@ -1231,7 +1231,48 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
     return nullptr;
   }
 
-  // Form a compaction object containing the files we picked.
+  //HUAPENG HLL
+  if (level == 0) {
+    uint64_t total_keys = 0;
+    std::vector<HyperLogLog*> v;
+
+    if(true) {
+      const std::vector<FileMetaData*>& level_files = vstorage->LevelFiles(0);
+      for (auto f : level_files) {
+        total_keys += f->hll_add_count;
+        v.push_back(f->hll.get());
+        //fprintf(stdout, "file=%ld %ld ", f->fd.GetNumber(), f->hll_add_count);
+      }
+    }
+
+    if (false) {
+    for (auto& input_level : compaction_inputs) {
+      for (auto f : input_level.files) {
+        total_keys += f->hll_add_count;
+        v.push_back(f->hll.get());
+        //fprintf(stdout, "file=%ld %ld ", f->fd.GetNumber(), f->hll_add_count);
+      }
+    }
+    }
+
+    uint64_t estimated = HyperLogLog::MergedEstimate(v);
+    const double reclaim_ratio = 1 - estimated * 1.0 / total_keys;
+    //fprintf(stdout, "total=%ld estimated=%ld ratio=%f\n", total_keys, estimated, reclaim_ratio);
+    //if(total_keys > 2000) {fflush(stdout); int * p = 0; *p = 1;};
+    // HLL hardcoded constants here
+    //if (reclaim_ratio < 1.2 && vstorage->LevelFiles(level).size() <= 6) {
+    if (reclaim_ratio < 0.4 && vstorage->LevelFiles(level).size() <= 6) {
+      //fprintf(stdout, "delayed reclaim ratio=%f size=%d\n", reclaim_ratio, vstorage->LevelFiles(level).size());
+      return nullptr;
+    }
+    //fprintf(stdout, "nodelayed reclaim ratio=%f size=%d\n", reclaim_ratio, vstorage->LevelFiles(level).size());
+  }
+
+  //HUAPENG HLL END
+
+  std::vector<FileMetaData*> grandparents;
+  GetGrandparents(vstorage, inputs, output_level_inputs, &grandparents);
+    // Form a compaction object containing the files we picked.
   Compaction* c = GetCompaction();
 
   TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
@@ -1423,6 +1464,9 @@ Compaction* FIFOCompactionPicker::PickTTLCompaction(
     VersionStorageInfo* vstorage, LogBuffer* log_buffer) {
   assert(ioptions_.compaction_options_fifo.ttl > 0);
 
+  //TODO change was done here for experiment with throughput as a function of time. 
+  return nullptr;
+  
   const int kLevel0 = 0;
   const std::vector<FileMetaData*>& level_files = vstorage->LevelFiles(kLevel0);
   uint64_t total_size = GetTotalFilesSize(level_files);

@@ -52,5 +52,7 @@ int main() {
 
   delete db;
 
+  printf("lol!!\n");
+
   return 0;
 }

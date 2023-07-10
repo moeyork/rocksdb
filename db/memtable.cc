@@ -11,6 +11,10 @@
 
 #include <memory>
 #include <algorithm>
+#include <limits>
+#include <iostream>
+#include <map>
+#include <math.h>
 
 #include "db/dbformat.h"
 #include "db/merge_context.h"
@@ -361,6 +365,7 @@ class MemTableIterator : public InternalIterator {
     return value_pinned_;
   }
 
+
  private:
   DynamicBloom* bloom_;
   const SliceTransform* const prefix_extractor_;
@@ -417,6 +422,306 @@ MemTable::MemTableStats MemTable::ApproximateStats(const Slice& start_ikey,
   return {entry_count * (data_size / n), entry_count};
 }
 
+void MemTable::PrintFrequencies(){
+  
+  for(auto i = KeyFrequencies.begin(); i != KeyFrequencies.end(); ++i) {
+    std::cout << "[" << i->first << "]=" << i->second <<";";
+  }
+  std::cout << "\n"; 
+}
+
+
+// Auxiliary function for SelectHotKeysWithError
+std::multimap<uint32_t, std::string> flipMap(std::map<std::string, uint32_t> & src, bool select_hot=true) {
+  std::multimap<uint32_t, std::string> dst;
+  for(std::map<std::string, uint32_t>::const_iterator it = src.begin(); it != src.end(); ++it)
+      // Insert only keys that are considered hot
+      // TODO replace with the isHot function, when that will exist
+      if (!select_hot){
+        dst.insert(std::pair<uint32_t, std::string>(it -> second, it -> first));  
+      } else if (select_hot && it->second > 10) {
+        dst.insert(std::pair<uint32_t, std::string>(it -> second, it -> first));
+      } 
+  return dst;
+}
+
+// select which keys are hot, starting from KeyFrequencies map, with a given amount of error; Place result in selectedHotMap
+std::map<std::string, uint32_t> MemTable::SelectHotKeysWithError(std::map<std::string, uint32_t> frequenciesMap, int errorRate){
+  
+  std::map<std::string, uint32_t>  selectedHotMap;
+
+  std::multimap<uint32_t, std::string> sortedByFreq;
+  std::multimap<uint32_t, std::string> freqsFirstKeysSecond = flipMap(frequenciesMap);
+
+  if (errorRate < 0) {
+     sortedByFreq = flipMap(frequenciesMap, false);
+  }
+
+  // printf("\nContents of flipped map in descending order:\n");
+  // for(std::multimap<uint32_t, std::string>::const_reverse_iterator it = freqsFirstKeysSecond.rbegin(); it != freqsFirstKeysSecond.rend(); ++it){
+  //     std::cout << "[" << it -> first << "; " << it -> second << "] "; 
+  //  }
+  // printf("\n");
+
+  // iterate on multimap and insert only (100-errorRate)% of it in the selectedHotMap
+  // How many keys do I keep?
+  int hotKeysKeepCount = freqsFirstKeysSecond.size() * (100-errorRate)/100;
+
+  int selectedHotMapElemCount = 0;
+
+  if (errorRate >= 0){
+    for(std::multimap<uint32_t, std::string>::const_reverse_iterator it = freqsFirstKeysSecond.rbegin(); it != freqsFirstKeysSecond.rend(); ++it) {    
+      if (selectedHotMapElemCount < hotKeysKeepCount){
+        selectedHotMap[it -> second] = it -> first;
+        selectedHotMapElemCount ++;
+      } else{
+        break;
+      }
+    }
+
+  } else {
+
+    for(std::multimap<uint32_t, std::string>::const_reverse_iterator it = sortedByFreq.rbegin(); it != sortedByFreq.rend(); ++it) {    
+      if (selectedHotMapElemCount < hotKeysKeepCount){
+        selectedHotMap[it -> second] = it -> first;
+        selectedHotMapElemCount ++;
+      } else {
+        break;
+      }
+
+    }
+  }
+
+
+  return selectedHotMap;
+
+}
+
+// select which keys are hot, starting from KeyFrequencies map, from a given quantile q up; Place result in selectedHotMap
+std::map<std::string, uint32_t> MemTable::SelectHotKeysWithQuantile(std::map<std::string, uint32_t> frequenciesMap, int q){
+  std::map<std::string, uint32_t>  selectedHotMap;
+
+  std::multimap<uint32_t, std::string> sortedByFreq = flipMap(frequenciesMap, false);
+
+  double sum_update_frequency = 0;
+  for(std::map<std::string, uint32_t>::const_iterator it = frequenciesMap.begin(); it != frequenciesMap.end(); ++it){
+    sum_update_frequency += it->second;
+  }
+
+  int updateCountQuantile = q * sum_update_frequency / 100;
+
+  for(std::multimap<uint32_t, std::string>::const_reverse_iterator it =     sortedByFreq.rbegin(); it != sortedByFreq.rend(); ++it) {    
+    if (updateCountQuantile > 0){
+      selectedHotMap[it -> second] = it -> first;
+      updateCountQuantile -= it -> first;
+    } else{
+      break;
+    }
+  }
+
+  return selectedHotMap;
+}
+
+std::map<std::string, uint32_t> MemTable::SelectHotKeysWithMean(std::map<std::string, uint32_t> frequenciesMap){
+  
+  std::map<std::string, uint32_t>  selectedHotMap;
+  
+  // Compute mean and stddev
+  uint64_t mean_update_frequency = 0;
+  uint64_t sum_update_frequency = 0; 
+  uint64_t hot_entries_count = 0;
+  uint64_t hot_keys_thresh = num_entries() * 50 / 100;
+  
+  for(std::map<std::string, uint32_t>::const_iterator it = frequenciesMap.begin(); it != frequenciesMap.end(); ++it){
+    sum_update_frequency += it->second;
+    //printf("it->second (update frequency): %d; sum update frequency: %d", it->second, sum_update_frequency);
+    
+  }
+  
+  mean_update_frequency = sum_update_frequency / frequenciesMap.size();
+  //printf("Sum update frequency: %d; Mean Update Frequency: %d; frequenciesMap.size(): %d", sum_update_frequency, mean_update_frequency, frequenciesMap.size());
+
+
+  // Select keys whose update frequencies higher than the mean.
+  for(std::map<std::string, uint32_t>::const_iterator it = frequenciesMap.begin(); it != frequenciesMap.end(); ++it){
+    if (hot_entries_count == hot_keys_thresh){
+      break;
+    }
+    if( it->second >= mean_update_frequency){
+      selectedHotMap[it -> first] = it -> second;
+      hot_entries_count ++;
+    }
+  }
+
+  //PrintFrequencies();
+  //printf("numentries selected hot: %d; mean_update_frequency: %d; size frequencies map: %d\n", hot_entries_count, mean_update_frequency, frequenciesMap.size());
+  return selectedHotMap;
+
+}
+
+
+std::map<std::string, uint32_t> MemTable::SelectHotKeysWithMeanStDev(std::map<std::string, uint32_t> frequenciesMap){
+  
+  std::map<std::string, uint32_t>  selectedHotMap;
+  
+  // Compute mean and stddev
+  double mean_update_frequency = 0;
+  double sum_update_frequency = 0;
+  double stddev_update_frequency = 0;
+  
+  for(std::map<std::string, uint32_t>::const_iterator it = frequenciesMap.begin(); it != frequenciesMap.end(); ++it){
+    sum_update_frequency += it->second;
+  }
+  
+  mean_update_frequency = sum_update_frequency / frequenciesMap.size();
+ 
+  for(std::map<std::string, uint32_t>::const_iterator it = frequenciesMap.begin(); it != frequenciesMap.end(); ++it){
+    stddev_update_frequency += (it->second - mean_update_frequency) * (it->second - mean_update_frequency);
+  }
+
+  stddev_update_frequency = sqrt(stddev_update_frequency) / frequenciesMap.size();
+
+  //PRINT 
+  std::cout << " Update Sum: " << sum_update_frequency << " Update Mean: " << mean_update_frequency << " Update Stdev: " << stddev_update_frequency << "\n";
+
+  // Select keys whose update frequencies are two standard deviations higher from the mean.
+  for(std::map<std::string, uint32_t>::const_iterator it = frequenciesMap.begin(); it != frequenciesMap.end(); ++it){
+    if( it->second >= mean_update_frequency + 2 * stddev_update_frequency){
+      selectedHotMap[it -> first] = it -> second;
+    }
+  }
+
+  return selectedHotMap;
+
+}
+
+
+bool MemTable::GetHotColdKeys(MemTable* hot_key_mem, MemTable* cold_key_mem, ReadOptions read_options){
+
+  bool coldKeyMapCreated = true;
+
+  //printf("numentries : %d\n", num_entries());
+
+  //PRINT std::cout << "Frequencies:\n";
+  //PrintFrequencies();
+
+  //select which keys are hot, starting from KeyFrequencies
+  //std::map<std::string, uint32_t> hotKeysWithError = SelectHotKeysWithError(KeyFrequencies, 0); //last parameter indicates the error rate
+  std::map<std::string, uint32_t> hotKeysWithError = SelectHotKeysWithMean(KeyFrequencies);
+
+  
+  // //TODO here replace the call above with a call to the map with mean and standard deviation or with quantiles.
+  //std::map<std::string, uint32_t> hotKeysWithMean = SelectHotKeysWithMean(KeyFrequencies);
+  //std::map<std::string, uint32_t> hotKeysWithMeanStDev = SelectHotKeysWithMeanStDev(KeyFrequencies); 
+
+  //std::map<std::string, uint32_t> hotKeysWithQuantile90 = SelectHotKeysWithQuantile(KeyFrequencies, 90); 
+  //std::map<std::string, uint32_t> hotKeysWithQuantile80 = SelectHotKeysWithQuantile(KeyFrequencies, 80); 
+
+  // //PRINT 
+  //std::cout <<"Hot Keys with error: " << hotKeysWithError.size() << "; Hot Keys with mean: " << hotKeysWithMean.size() << "; Hot Keys with mean AND stdev: " << hotKeysWithMeanStDev.size() <<"; Hot Keys Quantile 90: " << hotKeysWithQuantile90.size() << "; Hot Keys Quantile 80: " << hotKeysWithQuantile80.size() << "\n";
+
+
+
+  auto iter = new MemTableIterator(*this, read_options, nullptr);
+  iter->SeekToFirst();
+  while(iter->Valid()){
+
+    Slice memtable_key = iter->key();
+    Slice memtable_value = iter->value();   
+    ParsedInternalKey parsed_key = ParsedInternalKey();
+    ParseInternalKey(memtable_key, &parsed_key);
+
+    std::string s = std::string(memtable_key.data(), memtable_key.size()); 
+    std::size_t found_header = s.find_first_of('\x01');
+    std::size_t found_null = s.find_first_of('\x00');
+
+    std::string slice_str = s.substr(0, std::min(found_header, found_null));
+    auto it = KeyFrequencies.find(slice_str);
+    uint32_t val = 0;
+    if (it != KeyFrequencies.end()){
+      val = it->second;
+    }
+
+
+    if (val != 0){
+
+      auto it_hot_error = hotKeysWithError.find(slice_str);
+
+      //check whether this is a key considered hot
+      if (it_hot_error != hotKeysWithError.end()){
+        hotKeysWithError.erase(slice_str);
+        KeyFrequencies.erase(slice_str);
+        slice_str += '\0';
+        hot_key_mem->Add(parsed_key.sequence, parsed_key.type, Slice(slice_str.c_str()), memtable_value);
+      } else{
+        hotKeysWithError.erase(slice_str);
+        KeyFrequencies.erase(slice_str);
+        slice_str += '\0';
+        cold_key_mem->Add(parsed_key.sequence, parsed_key.type, Slice(slice_str.c_str()), memtable_value);
+      }
+    }
+
+    iter->Next();
+  } 
+  
+  //Print hot keys
+  // auto iter_hot = new MemTableIterator(*hot_key_mem, read_options, nullptr);
+  // iter_hot->SeekToFirst();
+  // std::cout << "Hot keys: ";
+  // while(iter_hot->Valid()){
+  //   Slice memtable_key_hot = iter_hot->key();
+  //   std::string s = std::string(memtable_key_hot.data(), memtable_key_hot.size()); 
+  //   std::size_t found_header = s.find_first_of('\x01');
+  //   std::size_t found_null = s.find_first_of('\x00');
+  //   std::string slice_str = s.substr(0, std::min(found_header, found_null));
+  //   std::cout << "[" << slice_str << "]";
+  //   iter_hot->Next();
+  // }
+  // std::cout << "\n";
+
+  // //Print cold keys
+  // auto iter_cold = new MemTableIterator(*cold_key_mem, read_options, nullptr);
+  // iter_cold->SeekToFirst();
+  // std::cout << "Cold keys: ";
+  // while(iter_cold->Valid()){
+  //   Slice memtable_key_cold = iter_cold->key();
+  //   std::string s = std::string(memtable_key_cold.data(), memtable_key_cold.size()); 
+  //   std::size_t found_header = s.find_first_of('\x01');
+  //   std::size_t found_null = s.find_first_of('\x00');
+  //   std::string slice_str = s.substr(0, std::min(found_header, found_null));
+  //   std::cout << "[" << slice_str << "]";
+  //   iter_cold->Next();
+  // }
+  // std::cout << "\n";
+
+  //std::cout << "GetHotColdKeys END\n";
+  //PRINT printf("HotKeys size: %lu\n", hot_key_mem->num_entries());
+  //PRINT printf("ColdKeys size: %lu\n", cold_key_mem->num_entries());
+  if (cold_key_mem->num_entries() < 100) {
+    coldKeyMapCreated = false;
+    auto iter = new MemTableIterator(*cold_key_mem, read_options, nullptr);
+    iter->SeekToFirst();
+    while(iter->Valid()){
+      Slice memtable_key = iter->key();
+      Slice memtable_value = iter->value();   
+      ParsedInternalKey parsed_key = ParsedInternalKey();
+      ParseInternalKey(memtable_key, &parsed_key);
+
+      std::string s = std::string(memtable_key.data(), memtable_key.size()); 
+      std::size_t found_header = s.find_first_of('\x01');
+      std::size_t found_null = s.find_first_of('\x00');
+      std::string slice_str = s.substr(0, std::min(found_header, found_null));
+      
+      hot_key_mem->Add(parsed_key.sequence, parsed_key.type, Slice(slice_str.c_str()), memtable_value);
+      iter->Next();
+    }
+
+  //PRINT printf("HotKeys size: %lu\n", hot_key_mem->num_entries());
+  //PRINT printf("ColdKeys size: %lu\n", 0);
+ } 
+ return coldKeyMapCreated;
+}
+
 void MemTable::Add(SequenceNumber s, ValueType type,
                    const Slice& key, /* user key */
                    const Slice& value, bool allow_concurrent,
@@ -426,6 +731,18 @@ void MemTable::Add(SequenceNumber s, ValueType type,
   //  key bytes    : char[internal_key.size()]
   //  value_size   : varint32 of value.size()
   //  value bytes  : char[value.size()]
+  
+
+  
+  // This is not thread safe; won't get accurate counting; hopefully, we'll get a good enough estimate.
+  //m_key_frequencies.lock();
+
+  //TODO uncomment Updating Key Frequencies
+  //std::string str_key(key.data(), key.size());
+  //KeyFrequencies[str_key]++;
+
+  //m_key_frequencies.unlock();
+
   uint32_t key_size = static_cast<uint32_t>(key.size());
   uint32_t val_size = static_cast<uint32_t>(value.size());
   uint32_t internal_key_size = key_size + 8;
@@ -447,6 +764,8 @@ void MemTable::Add(SequenceNumber s, ValueType type,
   p = EncodeVarint32(p, val_size);
   memcpy(p, value.data(), val_size);
   assert((unsigned)(p + val_size - buf) == (unsigned)encoded_len);
+  
+
   if (!allow_concurrent) {
     // Extract prefix for insert with hint.
     if (insert_with_hint_prefix_extractor_ != nullptr &&
@@ -487,6 +806,7 @@ void MemTable::Add(SequenceNumber s, ValueType type,
     assert(post_process_info == nullptr);
     UpdateFlushState();
   } else {
+
     table->InsertConcurrently(handle);
 
     assert(post_process_info != nullptr);
@@ -637,13 +957,15 @@ bool MemTable::Get(const LookupKey& key, std::string* value, Status* s,
                    RangeDelAggregator* range_del_agg, SequenceNumber* seq,
                    const ReadOptions& read_opts) {
   // The sequence number is updated synchronously in version_set.h
+  
+  Slice user_key = key.user_key();
+
   if (IsEmpty()) {
     // Avoiding recording stats for speed.
     return false;
   }
   PERF_TIMER_GUARD(get_from_memtable_time);
 
-  Slice user_key = key.user_key();
   bool found_final_value = false;
   bool merge_in_progress = s->IsMergeInProgress();
   bool const may_contain =
@@ -881,5 +1203,6 @@ void MemTable::RefLogContainingPrepSection(uint64_t log) {
 uint64_t MemTable::GetMinLogContainingPrepSection() {
   return min_prep_log_referenced_.load();
 }
+
 
 }  // namespace rocksdb

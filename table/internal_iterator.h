@@ -95,6 +95,12 @@ class InternalIterator : public Cleanable {
     return Status::NotSupported("");
   }
 
+  //HUAPENG
+  int level_ = -1;
+
+  int level() {return level_;}
+  //END HUAPENG
+
  protected:
   void SeekForPrevImpl(const Slice& target, const Comparator* cmp) {
     Seek(target);

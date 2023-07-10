@@ -3392,7 +3392,13 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
           edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
                        f->fd.GetFileSize(), f->smallest, f->largest,
                        f->smallest_seqno, f->largest_seqno,
-                       f->marked_for_compaction);
+                       f->marked_for_compaction,
+                       f->hll,
+                       f->reclaim_ratio,
+                       f->file_num_low,
+                       f->file_num_high,
+                       f->num_sst_next_level_overlap,
+                       f->hll_add_count);
         }
       }
       edit.SetLogNumber(cfd->GetLogNumber());
@@ -3609,6 +3615,7 @@ InternalIterator* VersionSet::MakeInputIterator(
             new LevelFileNumIterator(cfd->internal_comparator(),
                                      c->input_levels(which),
                                      false /* don't sample compaction */));
+      list[num - 1]->level_ = c->level(which); //HUAPENG
       }
     }
   }

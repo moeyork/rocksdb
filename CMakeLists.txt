@@ -458,6 +458,15 @@ set(SOURCES
         util/filename.cc
         util/filter_policy.cc
         util/hash.cc
+        util/histogram.cc
+        util/histogram_windowing.cc
+        util/hyperloglog.cc
+        util/instrumented_mutex.cc
+        util/iostats_context.cc
+        util/lru_cache.cc
+        tools/ldb_cmd.cc
+        tools/ldb_tool.cc
+        util/logging.cc
         util/log_buffer.cc
         util/murmurhash.cc
         util/random.cc

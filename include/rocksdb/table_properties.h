@@ -49,6 +49,7 @@ struct TablePropertiesNames {
   static const std::string kPropertyCollectors;
   static const std::string kCompression;
   static const std::string kCreationTime;
+  static const std::string kLevel; //HUAPENG
 };
 
 extern const std::string kPropertiesBlock;
@@ -162,6 +163,11 @@ struct TableProperties {
   // The time when the SST file was created.
   // Since SST files are immutable, this is equivalent to last modified time.
   uint64_t creation_time = 0;
+
+  //HUAPENG
+  // The level where the sst is created.
+  uint64_t level = -1;    
+  //END HUAPENG    
 
   // Name of the column family with which this SST file is associated.
   // If column family is unknown, `column_family_name` will be an empty string.
