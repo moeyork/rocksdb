@@ -2470,6 +2470,7 @@ rocksdb_ratelimiter_t* rocksdb_ratelimiter_create(
     int64_t refill_period_us,
     int32_t fairness) {
   rocksdb_ratelimiter_t* rate_limiter = new rocksdb_ratelimiter_t;
+  printf(">>>> c.cc rate limiter\n");
   rate_limiter->rep = NewGenericRateLimiter(rate_bytes_per_sec,
                                             refill_period_us, fairness);
   return rate_limiter;

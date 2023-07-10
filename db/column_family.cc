@@ -803,11 +803,14 @@ void ColumnFamilyData::CreateNewMemtable(
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
+  //return false;
   return compaction_picker_->NeedsCompaction(current_->storage_info());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
     const MutableCFOptions& mutable_options, LogBuffer* log_buffer) {
+  
+  //return nullptr;
   auto* result = compaction_picker_->PickCompaction(
       GetName(), mutable_options, current_->storage_info(), log_buffer);
   if (result != nullptr) {
@@ -830,6 +833,7 @@ Compaction* ColumnFamilyData::CompactRange(
     const MutableCFOptions& mutable_cf_options, int input_level,
     int output_level, uint32_t output_path_id, const InternalKey* begin,
     const InternalKey* end, InternalKey** compaction_end, bool* conflict) {
+
   auto* result = compaction_picker_->CompactRange(
       GetName(), mutable_cf_options, current_->storage_info(), input_level,
       output_level, output_path_id, begin, end, compaction_end, conflict);

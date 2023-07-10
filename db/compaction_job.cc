@@ -512,7 +512,6 @@ void CompactionJob::GenSubcompactionBoundaries() {
 }
 
 Status CompactionJob::Run() {
-
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
   TEST_SYNC_POINT("CompactionJob::Run():Start");
@@ -764,8 +763,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       input.get(), cfd->user_comparator(), &merge, versions_->LastSequence(),
       &existing_snapshots_, earliest_write_conflict_snapshot_, env_, false,
       range_del_agg.get(), sub_compact->compaction, compaction_filter,
-      comp_event_listener, shutting_down_,
-      nullptr, &env_options_, &dbname_)); //HUAPENG
+      comp_event_listener, shutting_down_));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
   if (c_iter->Valid() &&

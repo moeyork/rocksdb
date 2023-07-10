@@ -3615,7 +3615,6 @@ InternalIterator* VersionSet::MakeInputIterator(
             new LevelFileNumIterator(cfd->internal_comparator(),
                                      c->input_levels(which),
                                      false /* don't sample compaction */));
-      list[num - 1]->level_ = c->level(which); //HUAPENG
       }
     }
   }

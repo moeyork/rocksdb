@@ -31,6 +31,8 @@ class WriteController {
         last_refill_time_(0),
         low_pri_rate_limiter_(
             NewGenericRateLimiter(low_pri_rate_bytes_per_sec)) {
+
+          printf(">>>> WriteController rate limiter low_pri_rate_limiter_\n");
     set_max_delayed_write_rate(_delayed_write_rate);
   }
   ~WriteController() = default;

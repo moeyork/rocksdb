@@ -204,7 +204,6 @@ Status ExternalSstFileIngestionJob::Run() {
                   0/*file_num_high*/,
                   0/*num_sst_next_level_overlap*/,
                   0/*hll_add_count*/);
-                  
   }
 
   if (consumed_seqno) {

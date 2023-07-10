@@ -115,8 +115,7 @@ struct FileMetaData {
   uint64_t file_num_high;
   int num_sst_next_level_overlap;
   int hll_add_count;
-
-
+  
   FileMetaData()
       : smallest_seqno(kMaxSequenceNumber),
         largest_seqno(0),

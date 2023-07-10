@@ -636,6 +636,33 @@ Status DBImpl::ContinueBackgroundWork() {
   return Status::OK();
 }
 
+Status DBImpl::PauseCompactionWork() {
+  printf(" ->>>>??? Pausing compaction from DB\n");
+  InstrumentedMutexLock guard_lock(&mutex_);
+  bg_compaction_paused_++;
+  while (bg_compaction_scheduled_ > 0 ) {
+    bg_cv_.Wait();
+  }
+  bg_compaction_paused_++;
+  return Status::OK();
+}
+
+Status DBImpl::ContinueCompactionWork() {
+  printf(" ->>>>??? Resuming compaction from DB\n");
+  InstrumentedMutexLock guard_lock(&mutex_);
+  if (bg_compaction_paused_ == 0) {
+    return Status::InvalidArgument();
+  }
+  assert(bg_compaction_paused_ > 0);
+  bg_compaction_paused_--;
+  // It's sufficient to check just bg_work_paused_ here since
+  // bg_work_paused_ is always no greater than bg_compaction_paused_
+  if (bg_compaction_paused_ == 0) {
+    MaybeScheduleFlushOrCompaction();
+  }
+  return Status::OK();
+}
+
 void DBImpl::NotifyOnCompactionCompleted(
     ColumnFamilyData* cfd, Compaction *c, const Status &st,
     const CompactionJobStats& compaction_job_stats,
@@ -748,7 +775,13 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
       edit.AddFile(to_level, f->fd.GetNumber(), f->fd.GetPathId(),
                    f->fd.GetFileSize(), f->smallest, f->largest,
                    f->smallest_seqno, f->largest_seqno,
-                   f->marked_for_compaction);
+                   f->marked_for_compaction,
+                   f->hll,
+                   f->reclaim_ratio,
+                   f->file_num_low,
+                   f->file_num_high,
+                   f->num_sst_next_level_overlap,
+                   f->hll_add_count);
     }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                     "[%s] Apply version edit:\n%s", cfd->GetName().c_str(),
@@ -999,6 +1032,9 @@ Status DBImpl::EnableAutoCompaction(
 
 void DBImpl::MaybeScheduleFlushOrCompaction() {
   mutex_.AssertHeld();
+
+  printf("[COMPACTION-QUEUES] Compactions waiting: %d \n", unscheduled_compactions_ + bg_compaction_scheduled_);
+
   if (!opened_successfully_) {
     // Compaction may introduce data race to DB open
     return;
@@ -1030,6 +1066,30 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
       bg_flush_scheduled_++;
       env_->Schedule(&DBImpl::BGWorkFlush, this, Env::Priority::LOW, this);
     }
+  }
+
+  // SILK. If necessary, here we can schedule a HIGH priority compaction
+  // This will be (L0->L1) compactions because they are picked first by the
+  // compaction picker.
+  // This compaction has priority and it will be scheduled even if background 
+  // compactions are paused by bg_compaction_paused_
+
+  ColumnFamilyData* cfd = static_cast<ColumnFamilyHandleImpl*>(DefaultColumnFamily())->cfd();
+  VersionStorageInfo* vstorage = cfd->current()->storage_info();
+  if (env_->GetThreadPoolQueueLen(Env::Priority::HIGH) < 2 &&
+      ( num_running_flushes_ < 2 ||    
+      unscheduled_flushes_ < 2 ) &&
+      unscheduled_compactions_ > 0 &&  
+      vstorage->NumLevelFiles(0) >= 4) {
+    
+    CompactionArg* ca = new CompactionArg;
+    ca->db = this;
+    ca->m = nullptr;
+    bg_compaction_scheduled_++;
+    unscheduled_compactions_--;
+    env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::HIGH, this,
+                   &DBImpl::UnscheduleCallback);
+
   }
 
   if (bg_compaction_paused_ > 0) {
@@ -1239,7 +1299,9 @@ void DBImpl::BackgroundCallFlush() {
     auto pending_outputs_inserted_elem =
         CaptureCurrentFileNumberInPendingOutputs();
 
+
     Status s = BackgroundFlush(&made_progress, &job_context, &log_buffer);
+
     if (!s.ok() && !s.IsShutdownInProgress()) {
       // Wait a little bit before retrying background flush in
       // case this is an environmental problem and we do not want to
@@ -1562,7 +1624,13 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         c->edit()->AddFile(c->output_level(), f->fd.GetNumber(),
                            f->fd.GetPathId(), f->fd.GetFileSize(), f->smallest,
                            f->largest, f->smallest_seqno, f->largest_seqno,
-                           f->marked_for_compaction);
+                           f->marked_for_compaction,
+                           f->hll,
+                           f->reclaim_ratio,
+                           f->file_num_low,
+                           f->file_num_high,
+                           f->num_sst_next_level_overlap,
+                           f->hll_add_count);
 
         ROCKS_LOG_BUFFER(log_buffer, "[%s] Moving #%" PRIu64
                                      " to level-%d %" PRIu64 " bytes\n",

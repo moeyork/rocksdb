@@ -218,6 +218,13 @@ class StackableDB : public DB {
     return db_->ContinueBackgroundWork();
   }
 
+  virtual Status PauseCompactionWork() override {
+    return db_->PauseCompactionWork();
+  }
+  virtual Status ContinueCompactionWork() override {
+    return db_->ContinueCompactionWork();
+  }
+
   virtual Status EnableAutoCompaction(
       const std::vector<ColumnFamilyHandle*>& column_family_handles) override {
     return db_->EnableAutoCompaction(column_family_handles);

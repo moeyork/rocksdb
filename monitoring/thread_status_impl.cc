@@ -5,6 +5,7 @@
 //
 
 #include <sstream>
+#include <iostream>
 
 #include "rocksdb/env.h"
 #include "rocksdb/thread_status.h"
@@ -16,8 +17,9 @@ namespace rocksdb {
 #ifdef ROCKSDB_USING_THREAD_STATUS
 const std::string& ThreadStatus::GetThreadTypeName(
     ThreadStatus::ThreadType thread_type) {
+
   static std::string thread_type_names[NUM_THREAD_TYPES + 1] = {
-      "High Pri", "Low Pri", "User", "Unknown"};
+      "High Pri", "Med Pri", "Low Pri", "User", "Unknown"};
   if (thread_type < 0 || thread_type >= NUM_THREAD_TYPES) {
     return thread_type_names[NUM_THREAD_TYPES];  // "Unknown"
   }

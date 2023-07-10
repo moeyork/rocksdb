@@ -139,7 +139,6 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
                    f->file_num_high,
                    f->num_sst_next_level_overlap,
                    f->hll_add_count);
-                   
     }
 
     status = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(),

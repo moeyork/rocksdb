@@ -77,7 +77,7 @@ class Writer {
   ~Writer();
 
   Status AddRecord(const Slice& slice);
-  Status AddRecord(const Slice& slice, std::string& fn, int32_t& offset); //HUAPENG
+
   WritableFileWriter* file() { return dest_.get(); }
   const WritableFileWriter* file() const { return dest_.get(); }
 

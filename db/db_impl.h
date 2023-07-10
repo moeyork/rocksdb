@@ -170,6 +170,9 @@ class DBImpl : public DB {
   virtual Status PauseBackgroundWork() override;
   virtual Status ContinueBackgroundWork() override;
 
+  virtual Status PauseCompactionWork() override;
+  virtual Status ContinueCompactionWork() override;
+
   virtual Status EnableAutoCompaction(
       const std::vector<ColumnFamilyHandle*>& column_family_handles) override;
 
@@ -1059,6 +1062,9 @@ class DBImpl : public DB {
 
   // count how many background compactions are running or have been scheduled
   int bg_compaction_scheduled_;
+
+    // count how many background compactions are running or have been scheduled
+  int bg_l0_compaction_scheduled_;
 
   // stores the number of compactions are currently running
   int num_running_compactions_;
