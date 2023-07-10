@@ -437,6 +437,7 @@ Status WriteBatch::Iterate(Handler* handler) const {
       default:
         return Status::Corruption("unknown WriteBatch tag");
     }
+    //break;//Assume 1 batch includes only 1 record. //HUAPENG
   }
   if (!s.ok()) {
     return s;

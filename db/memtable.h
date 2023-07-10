@@ -14,6 +14,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
+#include <mutex>
+#include <map>
+
 #include "db/dbformat.h"
 #include "db/memtable_allocator.h"
 #include "db/skiplist.h"
@@ -86,6 +90,8 @@ class MemTable {
                            const Slice& key) const override;
   };
 
+
+
   // MemTables are reference counted.  The initial reference count
   // is zero and the caller must call Ref() at least once.
   //
@@ -144,6 +150,7 @@ class MemTable {
                                                 std::memory_order_relaxed);
   }
 
+
   // Return an iterator that yields the contents of the memtable.
   //
   // The caller must ensure that the underlying MemTable remains live
@@ -160,6 +167,15 @@ class MemTable {
 
   InternalIterator* NewRangeTombstoneIterator(const ReadOptions& read_options,
                                               Arena* arena);
+
+
+  void PrintFrequencies();
+  std::map<std::string, uint32_t> SelectHotKeysWithError(std::map<std::string, uint32_t> frequenciesMap, int errorRate);
+  std::map<std::string, uint32_t> SelectHotKeysWithMean(std::map<std::string, uint32_t> frequenciesMap);
+  std::map<std::string, uint32_t> SelectHotKeysWithMeanStDev(std::map<std::string, uint32_t> frequenciesMap);
+  std::map<std::string, uint32_t> SelectHotKeysWithQuantile(std::map<std::string, uint32_t> frequenciesMap, int q);
+
+  bool GetHotColdKeys(MemTable* hot_key_mem, MemTable* cold_key_mem, ReadOptions read_options);
 
   // Add an entry into memtable that maps key to value at the
   // specified sequence number and with the specified type.
@@ -339,6 +355,16 @@ class MemTable {
   friend class MemTableIterator;
   friend class MemTableBackwardIterator;
   friend class MemTableList;
+
+  // struct cmpSlice {
+  //   bool operator()(const Slice& a, const Slice& b) const {
+  //       return a.compare(b) < 0 ;
+  //   }
+  // };
+
+  std::map<std::string, uint32_t> KeyFrequencies;
+  std::mutex m;
+  std::mutex m_key_frequencies;
 
   KeyComparator comparator_;
   const MemTableOptions moptions_;

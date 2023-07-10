@@ -16,7 +16,7 @@ CompactionIterator::CompactionIterator(
     SequenceNumber earliest_write_conflict_snapshot, Env* env,
     bool expect_valid_internal_key, RangeDelAggregator* range_del_agg,
     const Compaction* compaction, const CompactionFilter* compaction_filter,
-    LogBuffer* log_buffer)
+    LogBuffer* log_buffer, const EnvOptions* env_options, const std::string* dbname)
     : input_(input),
       cmp_(cmp),
       merge_helper_(merge_helper),
@@ -28,7 +28,8 @@ CompactionIterator::CompactionIterator(
       compaction_(compaction),
       compaction_filter_(compaction_filter),
       log_buffer_(log_buffer),
-      merge_out_iter_(merge_helper_) {
+      merge_out_iter_(merge_helper_),
+      env_options_(env_options) { //HUAPENG
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
       compaction_ == nullptr ? false : compaction_->bottommost_level();
@@ -52,6 +53,12 @@ CompactionIterator::CompactionIterator(
     ignore_snapshots_ = false;
   }
   input_->SetPinnedItersMgr(&pinned_iters_mgr_);
+
+  //HUAPENG
+  if (dbname) {
+    env_->GetAbsolutePath(*dbname, &absolute_path_);
+  }
+  //END HUAPENG
 }
 
 CompactionIterator::~CompactionIterator() {
@@ -122,6 +129,49 @@ void CompactionIterator::NextFromInput() {
   while (!valid_ && input_->Valid()) {
     key_ = input_->key();
     value_ = input_->value();
+
+    //HUAPENG
+    level_ = input_->level();
+    if (value_.size() == 18 && env_options_) {
+      int32_t offset = DecodeFixed32(value_.data());
+      int32_t len = DecodeFixed32(value_.data() + 4);
+      std::string fn(value_.data() + 8, len);
+      //fn = "/home/nutanix/data/stargate-storage/disks/BTHC520303PX480MGN/test/" + fn;
+      fn = absolute_path_ + "/" + fn;
+
+      if (log_name_reader_map_.count(fn) == 0) {
+        std::unique_ptr<RandomAccessFile> file;
+        Status s = env_->NewRandomAccessFile(fn, &file, *env_options_);
+        if(!s.ok()){
+          exit(-1);
+        }
+        std::shared_ptr<RandomAccessFileReader> file_reader(
+            new RandomAccessFileReader(std::move(file)));
+        log_name_reader_map_[fn] = file_reader;
+      }
+
+      std::shared_ptr<RandomAccessFileReader>& file_reader = log_name_reader_map_[fn];
+
+      //char *buf = new char[512];
+      Slice result;
+      Status s = file_reader->Read(offset, 512, &result, buf);
+      if(!s.ok()){
+        exit(-1);
+      }
+      uint32_t orig_value_len;
+      GetVarint32(&result, &orig_value_len);
+      if (orig_value_len != 225) {
+        orig_value_len = 225;
+        //exit(-1);
+      }
+      result.remove_suffix(result.size() - orig_value_len);
+      value_ = result;
+    }
+
+    //END HUAPENG
+
+
+
     iter_stats_.num_input_records++;
 
     if (!ParseInternalKey(key_, &ikey_)) {
@@ -381,6 +431,9 @@ void CompactionIterator::NextFromInput() {
       ++iter_stats_.num_record_drop_obsolete;
       input_->Next();
     } else if (ikey_.type == kTypeMerge) {
+      //HUAPENG
+      exit(-1);
+      //END HUAPENG
       if (!merge_helper_->HasOperator()) {
         LogToBuffer(log_buffer_, "Options::merge_operator is null.");
         status_ = Status::InvalidArgument(

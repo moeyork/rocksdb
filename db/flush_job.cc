@@ -255,9 +255,14 @@ Status FlushJob::WriteLevel0Table() {
       Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
           "[%s] [JOB %d] Flushing memtable with next log file: %" PRIu64 "\n",
           cfd_->GetName().c_str(), job_context_->job_id, m->GetNextLogNumber());
+
+      //PRINT printf("[%s] [JOB %d] Flushing memtable with next log file: %" PRIu64,
+      //PRINT   cfd_->GetName().c_str(), job_context_->job_id, m->GetNextLogNumber());
       memtables.push_back(m->NewIterator(ro, &arena));
       range_del_iters.push_back(m->NewRangeTombstoneIterator(ro, &arena));
       total_num_entries += m->num_entries();
+      //PRINT printf("Flushing: Total number of entries is %d\n", m->num_entries());
+
       total_num_deletes += m->num_deletes();
       total_memory_usage += m->ApproximateMemoryUsage();
     }
@@ -323,7 +328,14 @@ Status FlushJob::WriteLevel0Table() {
     edit_->AddFile(0 /* level */, meta_.fd.GetNumber(), meta_.fd.GetPathId(),
                    meta_.fd.GetFileSize(), meta_.smallest, meta_.largest,
                    meta_.smallest_seqno, meta_.largest_seqno,
-                   meta_.marked_for_compaction);
+                   meta_.marked_for_compaction,
+                   meta_.hll,
+                   meta_.reclaim_ratio,
+                   meta_.file_num_low,
+                   meta_.file_num_high,
+                   meta_.num_sst_next_level_overlap,
+                   meta_.hll_add_count);
+                   
   }
 
   // Note that here we treat flush as level 0 compaction in internal stats
@@ -333,6 +345,7 @@ Status FlushJob::WriteLevel0Table() {
   cfd_->internal_stats()->AddCompactionStats(0 /* level */, stats);
   cfd_->internal_stats()->AddCFStats(InternalStats::BYTES_FLUSHED,
                                      meta_.fd.GetFileSize());
+  //PRINT printf(", flushed bytes: %d \n",  meta_.fd.GetFileSize());
   RecordFlushIOStats();
   return s;
 }

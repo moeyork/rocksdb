@@ -46,6 +46,7 @@ struct TablePropertiesNames {
   static const std::string kPrefixExtractorName;
   static const std::string kPropertyCollectors;
   static const std::string kCompression;
+  static const std::string kLevel; //HUAPENG
 };
 
 extern const std::string kPropertiesBlock;
@@ -152,6 +153,11 @@ struct TableProperties {
   // by column_family_name.
   uint64_t column_family_id =
       rocksdb::TablePropertiesCollectorFactory::Context::kUnknownColumnFamily;
+
+  //HUAPENG
+  // The level where the sst is created.
+  uint64_t level = -1;    
+  //END HUAPENG    
 
   // Name of the column family with which this SST file is associated.
   // If column family is unknown, `column_family_name` will be an empty string.

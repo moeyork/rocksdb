@@ -51,7 +51,9 @@ class CompactionIterator {
                      RangeDelAggregator* range_del_agg,
                      const Compaction* compaction = nullptr,
                      const CompactionFilter* compaction_filter = nullptr,
-                     LogBuffer* log_buffer = nullptr);
+                     LogBuffer* log_buffer = nullptr,
+                     const EnvOptions* env_options = nullptr,
+                     const std::string* dbname = nullptr); //HUAPENG
 
   ~CompactionIterator();
 
@@ -70,6 +72,7 @@ class CompactionIterator {
   // Getters
   const Slice& key() const { return key_; }
   const Slice& value() const { return value_; }
+  int level() {return level_;} //HUAPENG
   const Status& status() const { return status_; }
   const ParsedInternalKey& ikey() const { return ikey_; }
   bool Valid() const { return valid_; }
@@ -123,6 +126,9 @@ class CompactionIterator {
   // The status is OK unless compaction iterator encounters a merge operand
   // while not having a merge operator defined.
   Status status_;
+
+  int level_ = -1;//HUAPENG
+
   // Stores the user key, sequence number and type of the current compaction
   // iterator output (or current key in the underlying iterator during
   // NextFromInput()).
@@ -158,5 +164,13 @@ class CompactionIterator {
   // is in or beyond the last file checked during the previous call
   std::vector<size_t> level_ptrs_;
   CompactionIteratorStats iter_stats_;
+
+  //HUAPENG
+  const EnvOptions* env_options_;
+  char buf[512];
+  std::unordered_map<std::string, std::shared_ptr<RandomAccessFileReader>> log_name_reader_map_;
+  std::string absolute_path_;
+  //END HUAPENG
+
 };
 }  // namespace rocksdb

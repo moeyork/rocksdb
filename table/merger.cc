@@ -268,6 +268,13 @@ class MergingIterator : public InternalIterator {
     return current_->value();
   }
 
+  //HUAPENG
+  int level() {
+    assert(Valid());
+    return current_->level();
+  }
+  //END HUAPENG
+
   virtual Status status() const override {
     Status s;
     for (auto& child : children_) {

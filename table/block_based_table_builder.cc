@@ -544,7 +544,8 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
     const CompressionType compression_type,
     const CompressionOptions& compression_opts,
     const std::string* compression_dict, const bool skip_filters,
-    const std::string& column_family_name) {
+    const std::string& column_family_name,
+    int level) { //HUAPENG
   BlockBasedTableOptions sanitized_table_options(table_options);
   if (sanitized_table_options.format_version == 0 &&
       sanitized_table_options.checksum != kCRC32c) {
@@ -570,6 +571,8 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
         &rep_->compressed_cache_key_prefix[0],
         &rep_->compressed_cache_key_prefix_size);
   }
+
+  level_ = level; //HUAPENG
 }
 
 BlockBasedTableBuilder::~BlockBasedTableBuilder() {
@@ -918,6 +921,8 @@ Status BlockBasedTableBuilder::Finish() {
       }
       property_collectors_names += "]";
       r->props.property_collectors_names = property_collectors_names;
+
+      r->props.level = level_; //HUAPENG
 
       // Add basic properties
       property_block_builder.AddTableProperty(r->props);

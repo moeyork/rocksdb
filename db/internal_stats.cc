@@ -807,8 +807,8 @@ void InternalStats::DumpCFStats(std::string* value) {
   snprintf(buf, sizeof(buf), "Uptime(secs): %.1f total, %.1f interval\n",
            seconds_up, interval_seconds_up);
   value->append(buf);
-  snprintf(buf, sizeof(buf), "Flush(GB): cumulative %.3f, interval %.3f\n",
-           flush_ingest / kGB, interval_flush_ingest / kGB);
+  snprintf(buf, sizeof(buf), "Flush(GB): cumulative %d B, interval %.3f\n",
+           flush_ingest , interval_flush_ingest / kGB);
   value->append(buf);
   snprintf(buf, sizeof(buf), "AddFile(GB): cumulative %.3f, interval %.3f\n",
            add_file_ingest / kGB, interval_add_file_inget / kGB);
@@ -847,9 +847,9 @@ void InternalStats::DumpCFStats(std::string* value) {
   }
 
   snprintf(buf, sizeof(buf),
-           "Cumulative compaction: %.2f GB write, %.2f MB/s write, "
+           "Cumulative compaction: %lu B write, %.2f MB/s write, "
            "%.2f GB read, %.2f MB/s read, %.1f seconds\n",
-           compact_bytes_write / kGB, compact_bytes_write / kMB / seconds_up,
+           compact_bytes_write , compact_bytes_write / kMB / seconds_up,
            compact_bytes_read / kGB, compact_bytes_read / kMB / seconds_up,
            compact_micros / kMicrosInSec);
   value->append(buf);

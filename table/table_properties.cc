@@ -92,6 +92,7 @@ std::string TableProperties::ToString(
                  kv_delim);
   AppendProperty(result, "(estimated) table size",
                  data_size + index_size + filter_size, prop_delim, kv_delim);
+  AppendProperty(result, "level", level, prop_delim, kv_delim); //HUAPENG
 
   AppendProperty(
       result, "filter policy name",
@@ -173,6 +174,7 @@ const std::string TablePropertiesNames::kPrefixExtractorName =
 const std::string TablePropertiesNames::kPropertyCollectors =
     "rocksdb.property.collectors";
 const std::string TablePropertiesNames::kCompression = "rocksdb.compression";
+const std::string TablePropertiesNames::kLevel = "rocksdb.level"; //HUAPENG
 
 extern const std::string kPropertiesBlock = "rocksdb.properties";
 // Old property block name for backward compatibility

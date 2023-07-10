@@ -46,7 +46,8 @@ class BlockBasedTableBuilder : public TableBuilder {
       const CompressionType compression_type,
       const CompressionOptions& compression_opts,
       const std::string* compression_dict, const bool skip_filters,
-      const std::string& column_family_name);
+      const std::string& column_family_name,
+      int level = -1); //HUAPENG
 
   // REQUIRES: Either Finish() or Abandon() has been called.
   ~BlockBasedTableBuilder();
@@ -83,6 +84,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Get table properties
   TableProperties GetTableProperties() const override;
 
+  int GetLevel() {return level_; } //HUAPENG
+
  private:
   bool ok() const { return status().ok(); }
 
@@ -102,6 +105,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   class BlockBasedTablePropertiesCollectorFactory;
   class BlockBasedTablePropertiesCollector;
   Rep* rep_;
+
+  int level_; //HUAPENG
 
   // Advanced operation: flush any buffered key/value pairs to file.
   // Can be used to ensure that two adjacent entries never live in

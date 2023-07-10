@@ -31,6 +31,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <iostream>
+#include <bitset>
 
 #include "db/auto_roll_logger.h"
 #include "db/builder.h"
@@ -928,6 +930,11 @@ void DBImpl::DeleteObsoleteFileImpl(Status file_deletion_status, int job_id,
     file_deletion_status =
         DeleteSSTFile(&immutable_db_options_, fname, path_id);
   } else {
+    //HUAPENG
+    if (fname.find(".log") != std::string::npos) {
+      return;
+    }
+    //END HUAPENG
     file_deletion_status = env_->DeleteFile(fname);
   }
   if (file_deletion_status.ok()) {
@@ -1821,7 +1828,14 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     edit->AddFile(level, meta.fd.GetNumber(), meta.fd.GetPathId(),
                   meta.fd.GetFileSize(), meta.smallest, meta.largest,
                   meta.smallest_seqno, meta.largest_seqno,
-                  meta.marked_for_compaction);
+                  meta.marked_for_compaction,
+                  meta.hll,
+                  meta.reclaim_ratio,
+                  meta.file_num_low,
+                  meta.file_num_high,
+                  meta.num_sst_next_level_overlap,
+                  meta.hll_add_count);
+
   }
 
   InternalStats::CompactionStats stats(1);
@@ -2622,7 +2636,14 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
       edit.AddFile(to_level, f->fd.GetNumber(), f->fd.GetPathId(),
                    f->fd.GetFileSize(), f->smallest, f->largest,
                    f->smallest_seqno, f->largest_seqno,
-                   f->marked_for_compaction);
+                   f->marked_for_compaction,
+                   f->hll,
+                   f->reclaim_ratio,
+                   f->file_num_low,
+                   f->file_num_high,
+                   f->num_sst_next_level_overlap,
+                   f->hll_add_count);            
+                   
     }
     Log(InfoLogLevel::DEBUG_LEVEL, immutable_db_options_.info_log,
         "[%s] Apply version edit:\n%s", cfd->GetName().c_str(),
@@ -2904,11 +2925,14 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
                              bool writes_stopped) {
   Status s;
   {
+
+    printf("FlushMemTable\n");
     WriteContext context;
     InstrumentedMutexLock guard_lock(&mutex_);
 
     if (cfd->imm()->NumNotFlushed() == 0 && cfd->mem()->IsEmpty()) {
       // Nothing to flush
+      printf("FlushMemTable: Nothing to flush\n");
       return Status::OK();
     }
 
@@ -3204,6 +3228,7 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
   if (cfd != nullptr) {
     const MutableCFOptions mutable_cf_options =
         *cfd->GetLatestMutableCFOptions();
+    
     LogToBuffer(
         log_buffer,
         "Calling FlushMemTableToOutputFile with column "
@@ -3554,7 +3579,14 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         c->edit()->AddFile(c->output_level(), f->fd.GetNumber(),
                            f->fd.GetPathId(), f->fd.GetFileSize(), f->smallest,
                            f->largest, f->smallest_seqno, f->largest_seqno,
-                           f->marked_for_compaction);
+                           f->marked_for_compaction,
+                           f->hll,
+                           f->reclaim_ratio,
+                           f->file_num_low,
+                           f->file_num_high,
+                           f->num_sst_next_level_overlap,
+                           f->hll_add_count);
+                           
 
         LogToBuffer(log_buffer,
                     "[%s] Moving #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
@@ -3965,19 +3997,24 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
   // First look in the memtable, then in the immutable memtable (if any).
   // s is both in/out. When in, s could either be OK or MergeInProgress.
   // merge_operands will contain the sequence of merges in the latter case.
+  
   LookupKey lkey(key, snapshot);
+
   PERF_TIMER_STOP(get_snapshot_time);
 
   bool skip_memtable =
       (read_options.read_tier == kPersistedTier && has_unpersisted_data_);
   bool done = false;
   if (!skip_memtable) {
+    //std::cout << "Not Skip memtable\n";
     if (sv->mem->Get(lkey, value, &s, &merge_context)) {
       done = true;
       RecordTick(stats_, MEMTABLE_HIT);
+      //std::cout << "Found in memtable\n";
     } else if (sv->imm->Get(lkey, value, &s, &merge_context)) {
       done = true;
       RecordTick(stats_, MEMTABLE_HIT);
+      //std::cout << "Found in immutable memtable\n";
     }
   }
   if (!done) {
@@ -4854,7 +4891,67 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       WriteBatchInternal::SetSequence(merged_batch, current_sequence);
 
       Slice log_entry = WriteBatchInternal::Contents(merged_batch);
-      status = logs_.back().writer->AddRecord(log_entry);
+      
+      //THIS IS COMMENTED OUT FROM HUAPENG IMPL
+      //status = logs_.back().writer->AddRecord(log_entry);
+      //HUAPENG
+      std::string absolute_fn;
+      int32_t offset; // where kHeader starts.
+      status = logs_.back().writer->AddRecord(log_entry, absolute_fn, offset);
+
+      for (int i = 0; i < write_group.size(); ++i) {
+
+      Slice tmp_input(write_group[i]->batch->Data());
+      int orig_size = tmp_input.size();
+      if (tmp_input.size() < WriteBatchInternal::kHeader) {
+        return Status::Corruption("malformed WriteBatch (too small)");
+      }
+      tmp_input.remove_prefix(WriteBatchInternal::kHeader); // Skip header
+      char tag = tmp_input[0];;
+      if (tag != kTypeValue) {
+        return Status::Corruption("Not acceptable WriteBatch");
+      }
+      tmp_input.remove_prefix(1);//Skip tag
+      Slice key;
+      if (!GetLengthPrefixedSlice(&tmp_input, &key)) { // Skip key
+        return Status::Corruption("bad WriteBatch Put");
+      }
+      int cur_size = tmp_input.size();
+      int len = orig_size - cur_size; // the lenghth of [kHeader, tag, key]
+      if(i==0)
+        offset += len; // The offset of value payload: [varint32, value]
+
+      //remove path prefix: /path/000001.log to 000001.log
+      std::string fn = absolute_fn.substr(db_absolute_path_.size() + 1);
+
+      // New value: [offset, length, log-file-name]]
+      std::string s(4 + 4 + fn.size(), 0);
+      EncodeFixed32((char *) s.c_str(), offset);
+      EncodeFixed32((char *) s.c_str() + 4, fn.size());
+      strncpy((char *)s.c_str() + 8, fn.c_str(), fn.size());
+
+      // Overwrite value
+      //(const_cast<std::string&>(write_group[0]->batch->Data())).resize(len + 1 + s.size());
+      //Slice tmp_input2(write_group[0]->batch->Data());
+      //tmp_input2.remove_prefix(len);
+      //EncodeVarint32((char*) tmp_input2.data(), s.size());
+      //memcpy((char*) tmp_input2.data() + 1, s.c_str(), s.size());
+
+      //EncodeVarint32((char*) tmp_input.data(), s.size());
+      //memcpy((char*) tmp_input.data() + 1, s.c_str(), s.size());
+      memcpy((char*) tmp_input.data() + 2, s.c_str(), s.size());
+      if (write_group[i]->batch->Data().size() < (len + 1 + s.size())) {
+        exit(-1);
+      }
+      //(const_cast<std::string&>(write_group[0]->batch->Data())).resize(len + 1 + s.size());
+
+      }
+      //END HUAPENG
+      
+
+
+
+
       total_log_size_ += log_entry.size();
       alive_log_files_.back().AddSize(log_entry.size());
       log_empty_ = false;
@@ -5063,8 +5160,7 @@ void DBImpl::NotifyOnMemTableSealed(ColumnFamilyData* cfd,
 }
 #endif  // ROCKSDB_LITE
 
-// REQUIRES: mutex_ is held
-// REQUIRES: this thread is currently at the front of the writer queue
+//NON-MODIFIED SwitchMemtable
 Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   mutex_.AssertHeld();
   unique_ptr<WritableFile> lfile;
@@ -5182,6 +5278,165 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
       cfd, new_superversion, mutable_cf_options));
   return s;
 }
+
+
+// // // HOTCOLD SWITCH MEMTABLE
+// // // REQUIRES: mutex_ is held
+// // // REQUIRES: this thread is currently at the front of the writer queue
+// Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
+//   mutex_.AssertHeld();
+//   unique_ptr<WritableFile> lfile;
+//   log::Writer* new_log = nullptr;
+//   MemTable* new_mem = nullptr;
+
+//   //TODO_OANA: Here, we should add the HOT entries in new_mem.
+//   MemTable* new_mem_hot = nullptr;
+//   MemTable* old_mem_cold = nullptr;
+//   bool coldMapValid;
+  
+//   // Attempt to switch to a new memtable and trigger flush of old.
+//   // Do this without holding the dbmutex lock.
+//   assert(versions_->prev_log_number() == 0);
+//   bool creating_new_log = !log_empty_;
+//   uint64_t recycle_log_number = 0;
+//   if (creating_new_log && immutable_db_options_.recycle_log_file_num &&
+//       !log_recycle_files.empty()) {
+//     recycle_log_number = log_recycle_files.front();
+//     log_recycle_files.pop_front();
+//   }
+//   uint64_t new_log_number =
+//       creating_new_log ? versions_->NewFileNumber() : logfile_number_;
+//   SuperVersion* new_superversion = nullptr;
+//   const MutableCFOptions mutable_cf_options = *cfd->GetLatestMutableCFOptions();
+
+//   // Set current_memtble_info for memtable sealed callback
+// #ifndef ROCKSDB_LITE
+//   MemTableInfo memtable_info;
+//   memtable_info.cf_name = cfd->GetName();
+//   memtable_info.first_seqno = cfd->mem()->GetFirstSequenceNumber();
+//   memtable_info.earliest_seqno = cfd->mem()->GetEarliestSequenceNumber();
+//   memtable_info.num_entries = cfd->mem()->num_entries();
+//   memtable_info.num_deletes = cfd->mem()->num_deletes();
+// #endif  // ROCKSDB_LITE
+//   // Log this later after lock release. It may be outdated, e.g., if background
+//   // flush happens before logging, but that should be ok.
+//   int num_imm_unflushed = cfd->imm()->NumNotFlushed();
+//   DBOptions db_options =
+//       BuildDBOptions(immutable_db_options_, mutable_db_options_);
+//   mutex_.Unlock();
+//   Status s;
+//   {
+//     if (creating_new_log) {
+//       EnvOptions opt_env_opt =
+//           env_->OptimizeForLogWrite(env_options_, db_options);
+//       if (recycle_log_number) {
+//         Log(InfoLogLevel::INFO_LEVEL, immutable_db_options_.info_log,
+//             "reusing log %" PRIu64 " from recycle list\n", recycle_log_number);
+//         s = env_->ReuseWritableFile(
+//             LogFileName(immutable_db_options_.wal_dir, new_log_number),
+//             LogFileName(immutable_db_options_.wal_dir, recycle_log_number),
+//             &lfile, opt_env_opt);
+//       } else {
+//         s = NewWritableFile(
+//             env_, LogFileName(immutable_db_options_.wal_dir, new_log_number),
+//             &lfile, opt_env_opt);
+//       }
+//       if (s.ok()) {
+//         // Our final size should be less than write_buffer_size
+//         // (compression, etc) but err on the side of caution.
+//         lfile->SetPreallocationBlockSize(
+//             GetWalPreallocateBlockSize(mutable_cf_options.write_buffer_size));
+//         unique_ptr<WritableFileWriter> file_writer(
+//             new WritableFileWriter(std::move(lfile), opt_env_opt));
+//         new_log =
+//             new log::Writer(std::move(file_writer), new_log_number,
+//                             immutable_db_options_.recycle_log_file_num > 0);
+//       }
+//     }
+
+//     if (s.ok()) {
+//       SequenceNumber seq = versions_->LastSequence();
+//       new_mem = cfd->ConstructNewMemtable(mutable_cf_options, seq);
+//       new_superversion = new SuperVersion();
+//     }
+
+//     // TODO_OANA For now, I'm creating these memtables here. Normally, 
+//     // they shouldn't be created while the mutex is held. I should construct the two from 
+//     // before the mutex is taken and just switch the pointers here.
+    
+//     SequenceNumber seq = versions_->LastSequence();
+//     MemTable* cur_mem = cfd->mem();  
+//     new_mem_hot = cfd->ConstructNewMemtable(mutable_cf_options, seq);
+//     old_mem_cold = cfd->ConstructNewMemtable(mutable_cf_options, seq);
+//     ReadOptions read_options;
+//     coldMapValid = cur_mem->GetHotColdKeys(new_mem_hot, old_mem_cold, read_options);
+//     //PRINT printf("Switch Memtable: HotKeys size: %d\n", new_mem_hot->num_entries());
+//     if(coldMapValid){
+//       //PRINT printf("Switch Memtable: ColdKeys size: %d\n", old_mem_cold->num_entries());
+//       old_mem_cold->Ref();
+//     }
+    
+// #ifndef ROCKSDB_LITE
+//     // PLEASE NOTE: We assume that there are no failable operations
+//     // after lock is acquired below since we are already notifying
+//     // client about mem table becoming immutable.
+//     NotifyOnMemTableSealed(cfd, memtable_info);
+// #endif //ROCKSDB_LITE
+//   }
+//   Log(InfoLogLevel::INFO_LEVEL, immutable_db_options_.info_log,
+//       "[%s] New memtable created with log file: #%" PRIu64
+//       ". Immutable memtables: %d.\n",
+//       cfd->GetName().c_str(), new_log_number, num_imm_unflushed);
+//   mutex_.Lock();
+//   if (!s.ok()) {
+//     // how do we fail if we're not creating new log?
+//     assert(creating_new_log);
+//     assert(!new_mem);
+//     assert(!new_log);
+//     return s;
+//   }
+//   if (creating_new_log) {
+//     logfile_number_ = new_log_number;
+//     assert(new_log != nullptr);
+//     log_empty_ = true;
+//     log_dir_synced_ = false;
+//     logs_.emplace_back(logfile_number_, new_log);
+//     alive_log_files_.push_back(LogFileNumberSize(logfile_number_));
+//     for (auto loop_cfd : *versions_->GetColumnFamilySet()) {
+//       // all this is just optimization to delete logs that
+//       // are no longer needed -- if CF is empty, that means it
+//       // doesn't need that particular log to stay alive, so we just
+//       // advance the log number. no need to persist this in the manifest
+//       if (loop_cfd->mem()->GetFirstSequenceNumber() == 0 &&
+//           loop_cfd->imm()->NumNotFlushed() == 0) {
+//         loop_cfd->SetLogNumber(logfile_number_);
+//       }
+//     }
+//   }
+//   cfd->mem()->SetNextLogNumber(logfile_number_);
+//   if (coldMapValid){ 
+//    old_mem_cold->SetNextLogNumber(logfile_number_);
+  
+
+//   //Change here for diasbling HOT-COLD
+//   //TODO OANA This is the line where we add
+//   //cfd->imm()->Add(cfd->mem(), &context->memtables_to_free_);
+  
+
+//   //NO COMPACTION
+//   cfd->imm()->Add(old_mem_cold, &context->memtables_to_free_);
+//   }
+  
+//   new_mem = new_mem_hot;
+//   new_mem->Ref();
+//   cfd->SetMemtable(new_mem);
+  
+//   context->superversions_to_free_.push_back(InstallSuperVersionAndScheduleWork(
+//       cfd, new_superversion, mutable_cf_options));    
+  
+
+//   return s;
+// }
 
 #ifndef ROCKSDB_LITE
 Status DBImpl::GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
@@ -5866,6 +6121,7 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
     delete impl;
     return s;
   }
+
   impl->mutex_.Lock();
   // Handles create_if_missing, error_if_exists
   s = impl->Recover(column_families);

@@ -135,6 +135,14 @@ Status BuildTable(
     for (; c_iter.Valid(); c_iter.Next()) {
       const Slice& key = c_iter.key();
       const Slice& value = c_iter.value();
+
+      //HUAPENG COMMIT LOG
+      if (level == 0) {
+        //fprintf(stdout, "level=%d, vs=%d\n", level, value.size());
+        const_cast<Slice&>(value).remove_suffix(value.size() - 18);
+      }
+      //END HUAPENG COMMIT LOG
+
       builder->Add(key, value);
       meta->UpdateBoundaries(key, c_iter.ikey().sequence);
 

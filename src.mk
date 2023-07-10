@@ -109,7 +109,8 @@ LIB_SOURCES =                                                   \
   util/filter_policy.cc                                         \
   util/hash.cc                                                  \
   util/histogram.cc                                             \
-  util/histogram_windowing.cc                                   \
+  util/histogram_windowing.cc 									\
+  util/hyperloglog.cc                                  			\
   util/instrumented_mutex.cc                                    \
   util/iostats_context.cc                                       \
   util/io_posix.cc                                              \
